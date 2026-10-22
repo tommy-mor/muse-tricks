@@ -282,12 +282,21 @@ enum Cmd {
         force: bool,
     },
     /// Deal the next unvoted pair. Prints constitution + both texts + cmp id.
+    /// Target a side explicitly: `--a mem-0012` pins the left item (best
+    /// partner auto-picked), `--a .. --b ..` deals exactly that pair.
+    /// Plain `next` uses scope_rank's heart: bridging-first, degree-spread.
     Next {
         #[arg(long, default_value = "opinions")]
         scope: String,
         /// Deterministic pick (tests). Default: fresh randomness every deal.
         #[arg(long)]
         seed: Option<u64>,
+        /// Pin the left item by id (mem-0012) or index (12).
+        #[arg(long)]
+        a: Option<String>,
+        /// Pin the right item by id or index. Requires --a.
+        #[arg(long)]
+        b: Option<String>,
     },
     /// Judge a dealt comparison: scalar ratio, not binary. Reason must say why.
     /// `vote C --ratio 10:7` pours 10 parts to a, 7 to b — shares belong to
@@ -314,18 +323,21 @@ enum Cmd {
         #[arg(long, default_value = "opinions")]
         scope: String,
     },
-    /// Show the current ranking.
+    /// Show the current ranking, grouped by connected component.
+    /// No flat view: items only inside their groups, each on its own scale.
     Ranking {
         #[arg(long, default_value = "opinions")]
         scope: String,
-        #[arg(long, default_value = "20")]
+        /// How many groups to show (biggest first).
+        #[arg(long, default_value = "5")]
         top: usize,
     },
-    /// Render top memories as a markdown view file.
+    /// Render top memories as a markdown view file, grouped by component.
     Render {
         #[arg(long, default_value = "opinions")]
         scope: String,
-        #[arg(long, default_value = "50")]
+        /// How many groups to render (biggest first).
+        #[arg(long, default_value = "5")]
         top: usize,
         /// Output markdown file.
         #[arg(long, default_value = "top.md")]
@@ -531,7 +543,9 @@ fn vote_count(rt: &Runtime<Event>, scope: &str) -> i64 {
     s.count().get(rt.db()).unwrap_or_else(|e| fail(format!("read count: {e}")))
 }
 
-/// Random-walk scores over the edge graph. Order follows item indices.
+/// Random-walk scores over the WHOLE edge graph. Order follows item indices.
+/// Only meaningful when connected — across components the numbers share a
+/// denominator but no comparisons, so treat global scores as rough weather.
 fn scores(rt: &Runtime<Event>, scope: &str, n: usize) -> Vec<f64> {
     let s = Store::root().scopes().key(&scope.to_string());
     let edges = s
@@ -540,6 +554,37 @@ fn scores(rt: &Runtime<Event>, scope: &str, n: usize) -> Vec<f64> {
         .unwrap_or_else(|e| fail(format!("read edges: {e}")));
     let iter = edges.into_iter().map(|((a, b), w)| ((a as usize, b as usize), w));
     ranking::compute_scores_from_edges(n, iter, ranking::MAX_ITERS, ranking::TOL)
+}
+
+/// Per-component rankings: the honest output. Each connected hunk is ranked
+/// on its own induced subgraph (own denominator, own scale), biggest group
+/// first. Global scores ride along for weather, not for rank.
+fn grouped_ranking(
+    rt: &Runtime<Event>,
+    scope: &str,
+    n: usize,
+) -> (Vec<f64>, Vec<ranking::RankGroup>) {
+    let s = Store::root().scopes().key(&scope.to_string());
+    let edges = s
+        .edges()
+        .iter(rt.db())
+        .unwrap_or_else(|e| fail(format!("read edges: {e}")));
+    let triples: Vec<(usize, usize, f64)> = edges
+        .into_iter()
+        .map(|((a, b), w)| (a as usize, b as usize, w))
+        .collect();
+    let global = ranking::compute_scores_from_edges(
+        n,
+        triples.iter().map(|&(a, b, w)| ((a, b), w)),
+        ranking::MAX_ITERS,
+        ranking::TOL,
+    );
+    let voted_usize: std::collections::HashSet<(usize, usize)> = voted_set(rt, scope)
+        .into_iter()
+        .map(|(a, b)| (a as usize, b as usize))
+        .collect();
+    let groups = ranking::rank_groups(n, &voted_usize, &triples, ranking::MAX_ITERS, ranking::TOL);
+    (global, groups)
 }
 
 fn progress_json(rt: &Runtime<Event>, scope: &str, n: usize) -> serde_json::Value {
@@ -625,47 +670,93 @@ fn main() {
                 })
             );
         }
-        Cmd::Next { scope, seed } => {
+        Cmd::Next { scope, seed, a, b } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
             let n = data.items.len() as u32;
             if n < 2 {
                 fail("need at least 2 memories to deal a pair");
             }
+            // mem-0012 or 12 — stable ids from ranking output, raw index, done.
+            let parse_item = |s: &str| -> u32 {
+                let t = s.strip_prefix("mem-").unwrap_or(s);
+                t.parse::<u32>().unwrap_or_else(|_| {
+                    fail(format!("bad item '{s}': use mem-0012 or 12 (see ranking ids)"))
+                })
+            };
             let voted = voted_set(&rt, &scope);
             let pendings = pending_list(&rt, &scope);
             let pending_pairs: HashSet<(u32, u32)> = pendings
                 .iter()
                 .map(|(_, p)| if p.a < p.b { (p.a, p.b) } else { (p.b, p.a) })
                 .collect();
-            // Overlap-shy: don't re-deal items from the most recent deal
-            // still awaiting judgment, so the agent sees fresh meat first.
-            let current: Option<(u32, u32)> = pendings
-                .iter()
-                .map(|(_, p)| (p.a, p.b))
-                .max_by_key(|(a, b)| (*a as u64) << 32 | *b as u64)
-                .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
-            let dealt = match seed {
-                // Deterministic escape hatch for tests: uniform over opens.
-                Some(s) => {
-                    let mut candidates = Vec::new();
-                    for a in 0..n {
-                        for b in (a + 1)..n {
-                            if !voted.contains(&(a, b)) && !pending_pairs.contains(&(a, b)) {
-                                candidates.push((a, b));
+            let deal_open = |x: u32, y: u32| {
+                let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+                x != y
+                    && x < n
+                    && y < n
+                    && !voted.contains(&(lo, hi))
+                    && !pending_pairs.contains(&(lo, hi))
+            };
+            // Explicit pair beats everything: Master points, I spread.
+            // Single pin: best partner for her, bridging-first.
+            // Neither: the heart decides (or the seed, for tests).
+            let dealt: Option<(u32, u32)> = match (a, b) {
+                (Some(a_s), Some(b_s)) => {
+                    let (x, y) = (parse_item(&a_s), parse_item(&b_s));
+                    if x >= n || y >= n {
+                        fail(format!("item out of range (0..{n}): {a_s} {b_s}"));
+                    }
+                    if x == y {
+                        fail("cannot deal an item against itself");
+                    }
+                    if !deal_open(x, y) {
+                        fail("that pair is already voted or pending — pick another");
+                    }
+                    Some((x, y))
+                }
+                (Some(a_s), None) => {
+                    let x = parse_item(&a_s);
+                    if x >= n {
+                        fail(format!("item out of range (0..{n}): {a_s}"));
+                    }
+                    if seed.is_some() {
+                        fail("--seed with --a needs no partner search; drop --seed");
+                    }
+                    pair::suggest_partner_for(x, n, &voted, &pending_pairs).map(|y| (x, y))
+                }
+                (None, Some(_)) => fail("--b requires --a (pin the left side first)"),
+                (None, None) => {
+                    // Overlap-shy: don't re-deal items from the most recent deal
+                    // still awaiting judgment, so the agent sees fresh meat first.
+                    let current: Option<(u32, u32)> = pendings
+                        .iter()
+                        .map(|(_, p)| (p.a, p.b))
+                        .max_by_key(|(a, b)| (*a as u64) << 32 | *b as u64)
+                        .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+                    match seed {
+                        // Deterministic escape hatch for tests: uniform over opens.
+                        Some(s) => {
+                            let mut candidates = Vec::new();
+                            for a in 0..n {
+                                for b in (a + 1)..n {
+                                    if !voted.contains(&(a, b)) && !pending_pairs.contains(&(a, b)) {
+                                        candidates.push((a, b));
+                                    }
+                                }
+                            }
+                            if candidates.is_empty() {
+                                None
+                            } else {
+                                use rand::seq::IndexedRandom;
+                                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(s);
+                                Some(*candidates.choose(&mut rng).unwrap())
                             }
                         }
-                    }
-                    if candidates.is_empty() {
-                        None
-                    } else {
-                        use rand::seq::IndexedRandom;
-                        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(s);
-                        Some(*candidates.choose(&mut rng).unwrap())
+                        // scope_rank's heart: bridging-first, degree-spread, overlap-shy.
+                        None => pair::suggest_next_pair(n, &voted, &pending_pairs, current, None),
                     }
                 }
-                // scope_rank's heart: bridging-first, degree-spread, overlap-shy.
-                None => pair::suggest_next_pair(n, &voted, &pending_pairs, current, None),
             };
             let Some((a, b)) = dealt else {
                 println!(
@@ -782,20 +873,28 @@ fn main() {
         Cmd::Ranking { scope, top } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
-            let sc = scores(&rt, &scope, data.items.len());
-            let mut ranked: Vec<(u32, f64)> =
-                (0..data.items.len() as u32).map(|i| (i, sc[i as usize])).collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let items: Vec<_> = ranked
-                .into_iter()
-                .take(top)
+            let n = data.items.len();
+            let (_global, groups) = grouped_ranking(&rt, &scope, n);
+            // No flat view: items only exist inside their groups, each ranked
+            // on its own wet scale. Biggest hunk first; `--top` caps groups.
+            let groups_json: Vec<_> = groups
+                .iter()
                 .enumerate()
-                .map(|(r, (i, s))| {
+                .take(top)
+                .map(|(gi, g)| {
                     serde_json::json!({
-                        "rank": r + 1,
-                        "id": mem_id(i),
-                        "score": s,
-                        "text": data.items[i as usize],
+                        "group": gi,
+                        "size": g.members.len(),
+                        "pairs": g.pairs,
+                        "ranked": g.ranked.iter().enumerate().map(|(pos, &(m, s))| {
+                            serde_json::json!({
+                                "group_rank": pos + 1,
+                                "id": mem_id(m as u32),
+                                "index": m,
+                                "score": s,
+                                "text": data.items[m],
+                            })
+                        }).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
@@ -804,23 +903,25 @@ fn main() {
                 serde_json::json!({
                     "scope": scope,
                     "votes": vote_count(&rt, &scope),
-                    "items": items,
+                    "connected": groups.len() <= 1,
+                    "groups": groups_json,
                 })
             );
         }
         Cmd::Render { scope, top, output } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
-            let sc = scores(&rt, &scope, data.items.len());
-            let mut ranked: Vec<(u32, f64)> =
-                (0..data.items.len() as u32).map(|i| (i, sc[i as usize])).collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (_global, groups) = grouped_ranking(&rt, &scope, data.items.len());
             let votes = vote_count(&rt, &scope);
             let mut md = format!(
-                "# top memories — {scope} ({votes} votes)\n\n",
+                "# top memories — {scope} ({votes} votes, {} groups)\n\n",
+                groups.len(),
             );
-            for (r, (i, s)) in ranked.into_iter().take(top).enumerate() {
-                md.push_str(&format!("## {}. {} · score {s:.4}\n\n{}\n\n", r + 1, mem_id(i), data.items[i as usize]));
+            for (gi, g) in groups.iter().take(top).enumerate() {
+                md.push_str(&format!("## group {gi} — {} items, {} pairs\n\n", g.members.len(), g.pairs));
+                for (pos, &(m, s)) in g.ranked.iter().enumerate() {
+                    md.push_str(&format!("### {}. {} · score {s:.4}\n\n{}\n\n", pos + 1, mem_id(m as u32), data.items[m]));
+                }
             }
             fs::write(&output, md).unwrap_or_else(|e| fail(format!("write {}: {e}", output.display())));
             println!(

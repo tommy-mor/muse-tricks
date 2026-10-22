@@ -165,6 +165,55 @@ pub fn suggest_next_pair(
     best.map(|(_, _, _, a, b)| (a, b))
 }
 
+/// Pick the best partner for a pinned item: bridging-first across components,
+/// else lowest-degree. Never voted, never already pending. `None` when every
+/// pair containing `a` is voted or pending.
+/// The pinned side is explicit, so no `current` overlap penalty applies here.
+pub fn suggest_partner_for(
+    a: u32,
+    n: u32,
+    voted: &HashSet<(u32, u32)>,
+    pending: &HashSet<(u32, u32)>,
+) -> Option<u32> {
+    if n < 2 || a >= n {
+        return None;
+    }
+    let comp = component_ids(n, voted);
+    let mut comp_size = vec![0usize; comp.iter().copied().max().map(|m| m + 1).unwrap_or(0)];
+    for &c in &comp {
+        comp_size[c] += 1;
+    }
+    let mut degree = vec![0usize; n as usize];
+    for &(x, y) in voted {
+        let (x, y) = (x as usize, y as usize);
+        if x < n as usize && y < n as usize && x != y {
+            degree[x] += 1;
+            degree[y] += 1;
+        }
+    }
+    let mut best: Option<(u8, Reverse<usize>, usize, u32)> = None;
+    for b in 0..n {
+        if b == a {
+            continue;
+        }
+        if voted.contains(&canon(a, b)) || pending.contains(&canon(a, b)) {
+            continue;
+        }
+        // Cross-component first (0 beats 1), then the biggest target
+        // component, then the least-voted partner, then lowest index.
+        let cross = u8::from(comp[a as usize] == comp[b as usize]);
+        let key = (
+            cross,
+            Reverse(comp_size[comp[b as usize]]),
+            degree[b as usize],
+            b,
+        );
+        if best.as_ref().map_or(true, |best| key < *best) {
+            best = Some(key);
+        }
+    }
+    best.map(|(_, _, _, b)| b)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +294,20 @@ mod tests {
         // Nothing voted: with current (0,1), the clean pair avoids both.
         let next = suggest_next_pair(4, &HashSet::new(), &HashSet::new(), Some((0, 1)), None).unwrap();
         assert_eq!(canon(next.0, next.1), (2, 3));
+    }
+
+    #[test]
+    fn pinned_partner_prefers_bridge() {
+        // a=0 sits in {0,1}; the best partner bridges to the big component.
+        let v = voted(&[(0, 1), (2, 3), (3, 4)]);
+        assert_eq!(suggest_partner_for(0, 5, &v, &HashSet::new()), Some(2));
+    }
+
+    #[test]
+    fn pinned_partner_avoids_voted_and_pending() {
+        let v = voted(&[(0, 1)]);
+        let pending: HashSet<(u32, u32)> = [canon(0, 2)].into_iter().collect();
+        assert_eq!(suggest_partner_for(0, 3, &v, &pending), None);
+        assert_eq!(suggest_partner_for(0, 4, &v, &pending), Some(3));
     }
 }
