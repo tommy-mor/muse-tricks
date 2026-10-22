@@ -1,0 +1,4 @@
+markdown parser for meta/muse agent extracted memory markdown files
+that sorts memories pairwise according to a declaration .md file 
+cli that keeps track of every vote in durable/jsonl
+produce output rendered views as markdown files of top memories. pair chosing also, turn-based pair chosing that keeps its place between cli runs
