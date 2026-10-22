@@ -331,6 +331,28 @@ enum Cmd {
         #[arg(long, default_value = "top.md")]
         output: PathBuf,
     },
+    /// Render the ranking into a MEMORY.md-shaped file, gracefully.
+    ///
+    /// The sorter owns exactly one marker-delimited region of the file
+    /// (`<!-- sorter:begin scope=... -->` .. `<!-- sorter:end -->`); every
+    /// other byte — hand-written sections, the treaty header, the INBOX
+    /// tray — is preserved as-is. Re-running replaces only the region, so
+    /// rendering is idempotent for a fixed state. See docs/render-memory.md.
+    RenderMemory {
+        #[arg(long, default_value = "opinions")]
+        scope: String,
+        #[arg(long, default_value = "50")]
+        top: usize,
+        /// Existing MEMORY.md to merge into. Absent (or missing) = fresh file.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Where to write. Defaults to the input path, else MEMORY.md.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Heading written above the ranked bullets inside the region.
+        #[arg(long, default_value = "Ranked working set")]
+        heading: String,
+    },
     /// Scope health: items, votes, pairs dealt, pending comparisons.
     Status {
         #[arg(long, default_value = "opinions")]
@@ -351,6 +373,92 @@ enum Cmd {
     },
     /// Prove incremental == replay from zero.
     Verify,
+}
+
+/// The marker line that opens the sorter-managed region for `scope`.
+fn sorter_begin_marker(scope: &str) -> String {
+    format!("<!-- sorter:begin scope={scope} -->")
+}
+
+/// The marker line that closes any sorter-managed region.
+const SORTER_END_MARKER: &str = "<!-- sorter:end -->";
+
+/// Build the managed region: markers + heading + one bullet per ranked item,
+/// each bullet carrying its provenance (rank, score, item id) in a comment.
+/// Deterministic for a fixed state — no wall-clock anywhere — so a re-render
+/// of an unchanged state is byte-identical.
+fn render_memory_region(
+    scope: &str,
+    heading: &str,
+    ranked: &[(u32, f64)],
+    items: &[String],
+    votes: i64,
+) -> String {
+    let mut md = String::new();
+    md.push_str(&sorter_begin_marker(scope));
+    md.push('\n');
+    md.push_str(&format!(
+        "## {heading} — {scope} (sorter: {votes} votes, top {} of {})\n\n",
+        ranked.len(),
+        items.len()
+    ));
+    for (r, (i, s)) in ranked.iter().enumerate() {
+        let body = items[*i as usize].trim().replace('\n', "\n  ");
+        md.push_str(&format!(
+            "- {body} <!-- sorter:rank {} score {s:.4} id {} -->\n",
+            r + 1,
+            mem_id(*i)
+        ));
+    }
+    md.push_str(SORTER_END_MARKER);
+    md.push('\n');
+    md
+}
+
+/// Merge a managed region into an existing MEMORY.md text. Returns the new
+/// text and how the region landed:
+/// - "replaced": a region for this scope already existed; only its bytes changed.
+/// - "inserted-before-inbox": no region yet; placed just above the INBOX tray,
+///   which stays last by design.
+/// - "appended": no region and no INBOX; placed at the end.
+/// Everything outside the region is preserved byte-for-byte.
+fn merge_memory_md(existing: &str, region: &str, scope: &str) -> (String, &'static str) {
+    let begin = sorter_begin_marker(scope);
+    if let Some(b) = existing.find(&begin) {
+        if let Some(e_rel) = existing[b..].find(SORTER_END_MARKER) {
+            let mut end = b + e_rel + SORTER_END_MARKER.len();
+            if existing[end..].starts_with('\n') {
+                end += 1;
+            }
+            let mut out = String::with_capacity(existing.len() + region.len());
+            out.push_str(&existing[..b]);
+            out.push_str(region);
+            out.push_str(&existing[end..]);
+            return (out, "replaced");
+        }
+    }
+    // Find the INBOX heading at a line start, if any.
+    let inbox_at = existing
+        .find("\n## INBOX")
+        .map(|i| i + 1)
+        .or_else(|| existing.starts_with("## INBOX").then_some(0));
+    if let Some(at) = inbox_at {
+        let mut out = String::with_capacity(existing.len() + region.len() + 1);
+        out.push_str(&existing[..at]);
+        out.push_str(region);
+        out.push('\n');
+        out.push_str(&existing[at..]);
+        return (out, "inserted-before-inbox");
+    }
+    let mut out = String::from(existing);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(region);
+    (out, "appended")
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -720,6 +828,39 @@ fn main() {
                 serde_json::json!({"ok": true, "output": output.display().to_string(), "votes": votes})
             );
         }
+        Cmd::RenderMemory { scope, top, input, output, heading } => {
+            let rt = open_rt(&cli.state);
+            let data = load_scope(&rt, &scope);
+            let sc = scores(&rt, &scope, data.items.len());
+            let mut ranked: Vec<(u32, f64)> =
+                (0..data.items.len() as u32).map(|i| (i, sc[i as usize])).collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.truncate(top);
+            let votes = vote_count(&rt, &scope);
+            let region = render_memory_region(&scope, &heading, &ranked, &data.items, votes);
+            let out_path = output
+                .clone()
+                .or_else(|| input.clone())
+                .unwrap_or_else(|| PathBuf::from("MEMORY.md"));
+            let existing = input.as_ref().and_then(|p| fs::read_to_string(p).ok());
+            let (text, mode) = match &existing {
+                Some(ex) if !ex.trim().is_empty() => merge_memory_md(ex, &region, &scope),
+                _ => (
+                    format!("# MEMORY.md\n\n{region}\n## INBOX — unranked claims tray (append-only; folded into rank in session)\n"),
+                    "created",
+                ),
+            };
+            // Atomic write: temp file in the same directory, then rename over.
+            let tmp = out_path.with_extension("md.tmp-sorter");
+            fs::write(&tmp, &text)
+                .unwrap_or_else(|e| fail(format!("write {}: {e}", tmp.display())));
+            fs::rename(&tmp, &out_path)
+                .unwrap_or_else(|e| fail(format!("rename to {}: {e}", out_path.display())));
+            println!(
+                "{}",
+                serde_json::json!({"ok": true, "output": out_path.display().to_string(), "scope": scope, "votes": votes, "items_written": ranked.len(), "mode": mode})
+            );
+        }
         Cmd::Status { scope } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
@@ -850,5 +991,57 @@ mod tests {
         let items = parse_memories("- outer\n  - inner\n- second\n");
         assert_eq!(items.len(), 2);
         assert!(items[0].contains("inner"));
+    }
+
+    fn sample_region(scope: &str, note: &str) -> String {
+        let items = vec![format!("alpha {note}"), "beta".to_string()];
+        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, 7)
+    }
+
+    #[test]
+    fn memory_region_carries_provenance() {
+        let r = sample_region("world", "x");
+        assert!(r.starts_with("<!-- sorter:begin scope=world -->\n"));
+        assert!(r.trim_end().ends_with("<!-- sorter:end -->"));
+        assert!(r.contains("- alpha x <!-- sorter:rank 1 score 0.6000 id mem-0000 -->"));
+        assert!(r.contains("- beta <!-- sorter:rank 2 score 0.4000 id mem-0001 -->"));
+    }
+
+    #[test]
+    fn merge_inserts_before_inbox_and_preserves_the_rest() {
+        let doc = "# MEMORY.md\n\n<!-- treaty -->\n\n## Facts\n- hand written\n\n## INBOX — tray\n<!-- land here -->\n";
+        let (out, mode) = merge_memory_md(doc, &sample_region("world", "x"), "world");
+        assert_eq!(mode, "inserted-before-inbox");
+        // Everything hand-written survives, in order, INBOX still last.
+        assert!(out.contains("<!-- treaty -->"));
+        assert!(out.contains("## Facts\n- hand written\n"));
+        assert!(out.find("sorter:begin").unwrap() < out.find("## INBOX").unwrap());
+        assert!(out.ends_with("<!-- land here -->\n"));
+    }
+
+    #[test]
+    fn merge_replace_is_idempotent() {
+        let doc = "# MEMORY.md\n\n## INBOX — tray\n";
+        let region = sample_region("world", "x");
+        let (once, _) = merge_memory_md(doc, &region, "world");
+        let (twice, mode) = merge_memory_md(&once, &region, "world");
+        assert_eq!(mode, "replaced");
+        assert_eq!(once, twice);
+        // A changed region replaces in place; the rest of the file is unmoved.
+        let (thrice, _) = merge_memory_md(&once, &sample_region("world", "y"), "world");
+        assert!(thrice.contains("alpha y"));
+        assert!(!thrice.contains("alpha x"));
+        assert!(thrice.starts_with("# MEMORY.md\n"));
+        assert!(thrice.ends_with("## INBOX — tray\n"));
+    }
+
+    #[test]
+    fn merge_scopes_coexist() {
+        let doc = "# MEMORY.md\n\n## INBOX — tray\n";
+        let (one, _) = merge_memory_md(doc, &sample_region("world", "x"), "world");
+        let (two, _) = merge_memory_md(&one, &sample_region("opinions", "x"), "opinions");
+        assert!(two.contains("scope=world"));
+        assert!(two.contains("scope=opinions"));
+        assert_eq!(two.matches("## INBOX").count(), 1);
     }
 }
