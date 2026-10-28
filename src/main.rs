@@ -499,14 +499,17 @@ const SORTER_END_MARKER: &str = "<!-- sorter:end -->";
 
 /// Build the managed region: markers + heading + one bullet per ranked item,
 /// each bullet carrying its provenance (rank, score, item id) in a comment.
-/// Deterministic for a fixed state — no wall-clock anywhere — so a re-render
-/// of an unchanged state is byte-identical.
+/// `universe` is the size of the ranked universe — the largest connected
+/// component — NOT the whole bank: unvoted items are undefined and are
+/// never counted or shown. Deterministic for a fixed state — no wall-clock
+/// anywhere — so a re-render of an unchanged state is byte-identical.
 fn render_memory_region(
     scope: &str,
     heading: &str,
     ranked: &[(u32, f64)],
     items: &[String],
     votes: i64,
+    universe: usize,
 ) -> String {
     let mut md = String::new();
     md.push_str(&sorter_begin_marker(scope));
@@ -514,7 +517,7 @@ fn render_memory_region(
     md.push_str(&format!(
         "## {heading} — {scope} (sorter: {votes} votes, top {} of {})\n\n",
         ranked.len(),
-        items.len()
+        universe
     ));
     for (r, (i, s)) in ranked.iter().enumerate() {
         let body = items[*i as usize].trim().replace('\n', "\n  ");
@@ -687,6 +690,28 @@ fn grouped_ranking(
         .collect();
     let groups = ranking::rank_groups(n, &voted_usize, &triples, ranking::MAX_ITERS, ranking::TOL);
     (global, groups)
+}
+
+/// The renderable ranking for MEMORY.md: ONLY the largest connected
+/// component, ranked on its own induced subgraph. Unvoted items are
+/// undefined — they belong to no ranking and never render; smaller
+/// components wait for the dealer to bridge them in. Returns the
+/// (index, score) list, best-first, truncated to `top`, plus the size of
+/// the ranked universe. A largest component under 2 members means no
+/// vote has landed yet: the ranking is empty and the universe is 0.
+fn largest_group_ranked(groups: &[ranking::RankGroup], top: usize) -> (Vec<(u32, f64)>, usize) {
+    match groups.first() {
+        Some(g) if g.members.len() >= 2 => {
+            let ranked = g
+                .ranked
+                .iter()
+                .take(top)
+                .map(|&(m, s)| (m as u32, s))
+                .collect();
+            (ranked, g.members.len())
+        }
+        _ => (Vec::new(), 0),
+    }
 }
 
 fn progress_json(rt: &Runtime<Event>, scope: &str, n: usize) -> serde_json::Value {
@@ -1170,13 +1195,13 @@ fn main() {
         Cmd::RenderMemory { scope, top, input, output, heading } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
-            let sc = scores(&rt, &scope, data.items.len());
-            let mut ranked: Vec<(u32, f64)> =
-                (0..data.items.len() as u32).map(|i| (i, sc[i as usize])).collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            ranked.truncate(top);
+            // The honest ranking: largest connected component only, on its
+            // own induced subgraph. Global whole-pool scores are weather,
+            // not rank — unvoted items are undefined and never render.
+            let (_global, groups) = grouped_ranking(&rt, &scope, data.items.len());
+            let (ranked, universe) = largest_group_ranked(&groups, top);
             let votes = vote_count(&rt, &scope);
-            let region = render_memory_region(&scope, &heading, &ranked, &data.items, votes);
+            let region = render_memory_region(&scope, &heading, &ranked, &data.items, votes, universe);
             let out_path = output
                 .clone()
                 .or_else(|| input.clone())
@@ -1197,7 +1222,7 @@ fn main() {
                 .unwrap_or_else(|e| fail(format!("rename to {}: {e}", out_path.display())));
             println!(
                 "{}",
-                serde_json::json!({"ok": true, "output": out_path.display().to_string(), "scope": scope, "votes": votes, "items_written": ranked.len(), "mode": mode})
+                serde_json::json!({"ok": true, "output": out_path.display().to_string(), "scope": scope, "votes": votes, "items_written": ranked.len(), "ranked_universe": universe, "components": groups.len(), "mode": mode})
             );
         }
         Cmd::Status { scope } => {
@@ -1456,7 +1481,44 @@ mod tests {
 
     fn sample_region(scope: &str, note: &str) -> String {
         let items = vec![format!("alpha {note}"), "beta".to_string()];
-        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, 7)
+        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, 7, 2)
+    }
+
+    fn fake_group(members: &[usize], ranked: &[(usize, f64)]) -> ranking::RankGroup {
+        ranking::RankGroup {
+            members: members.to_vec(),
+            ranked: ranked.to_vec(),
+            pairs: ranked.len(),
+        }
+    }
+
+    #[test]
+    fn render_ranking_is_largest_component_only() {
+        // Biggest group first (rank_groups' contract); a smaller voted
+        // component and singletons must never leak into the render.
+        let groups = vec![
+            fake_group(&[3, 1, 9], &[(3, 0.5), (1, 0.3), (9, 0.2)]),
+            fake_group(&[0, 2], &[(0, 0.7), (2, 0.3)]),
+            fake_group(&[4], &[(4, 1.0)]),
+        ];
+        let (ranked, universe) = largest_group_ranked(&groups, 20);
+        assert_eq!(universe, 3);
+        assert_eq!(ranked, vec![(3, 0.5), (1, 0.3), (9, 0.2)]);
+        let (top2, _) = largest_group_ranked(&groups, 2);
+        assert_eq!(top2, vec![(3, 0.5), (1, 0.3)]);
+    }
+
+    #[test]
+    fn render_ranking_undefined_until_a_vote_lands() {
+        // All singletons (nothing voted): no ranking, universe 0 — an
+        // unvoted item must never be seated as "rank 1".
+        let groups = vec![fake_group(&[0], &[(0, 1.0)]), fake_group(&[1], &[(1, 1.0)])];
+        let (ranked, universe) = largest_group_ranked(&groups, 20);
+        assert!(ranked.is_empty());
+        assert_eq!(universe, 0);
+        let (ranked, universe) = largest_group_ranked(&[], 20);
+        assert!(ranked.is_empty());
+        assert_eq!(universe, 0);
     }
 
     #[test]
