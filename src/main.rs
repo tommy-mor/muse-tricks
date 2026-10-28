@@ -274,6 +274,37 @@ fn parse_memories(src: &str) -> Vec<String> {
     out
 }
 
+/// Parse a JSONL memories file: one JSON object per line, each with a
+/// string `body` (the memory, byte-exact — no trimming, no folding) and an
+/// optional string `ts_pt` ("YYYY-MM-DD HH:MM") rendered as a
+/// `[<ts_pt> PT] ` provenance header, matching the markdown banks.
+/// Malformed lines are loud errors with line numbers: this format is the
+/// archive of record for verbatim material, and silently skipping a line
+/// would silently lose someone's words.
+fn parse_memories_jsonl(src: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("jsonl line {}: {e}", i + 1))?;
+        let body = v
+            .get("body")
+            .and_then(|b| b.as_str())
+            .ok_or_else(|| format!("jsonl line {}: missing string field `body`", i + 1))?;
+        if body.trim().is_empty() {
+            continue;
+        }
+        match v.get("ts_pt").and_then(|t| t.as_str()) {
+            Some(ts) if !ts.is_empty() => out.push(format!("[{ts} PT] {body}")),
+            _ => out.push(body.to_string()),
+        }
+    }
+    Ok(out)
+}
+
 /// Cheap content fingerprint: std hash rendered as 16 hex digits.
 /// Change-detection, not security — the tape is the audit trail.
 fn fingerprint(s: &str) -> String {
@@ -306,9 +337,13 @@ struct Cli {
 enum Cmd {
     /// Load memories + constitution into a fresh state dir.
     Init {
-        /// Markdown file of memories (top-level list items).
+        /// Markdown file of memories (top-level list items), or a JSONL
+        /// memories file with --format jsonl (or a .jsonl path).
         #[arg(long, conflicts_with = "feed", required_unless_present = "feed")]
         memories: Option<PathBuf>,
+        /// Memories format: md | jsonl. Default: infer from extension.
+        #[arg(long)]
+        format: Option<String>,
         /// Raw JSONL feed: one {session,seq,timestamp,role,text} turn per line.
         #[arg(long, conflicts_with = "memories", required_unless_present = "memories")]
         feed: Option<PathBuf>,
@@ -791,6 +826,7 @@ fn main() {
     match cli.cmd {
         Cmd::Init {
             memories,
+            format,
             feed,
             constitution,
             scope,
@@ -811,13 +847,35 @@ fn main() {
             }
             let (raw, items) = match (&memories, &feed) {
                 (Some(mem), None) => {
-                    let md = fs::read_to_string(mem)
+                    let src = fs::read_to_string(mem)
                         .unwrap_or_else(|e| fail(format!("read {}: {e}", mem.display())));
-                    let items = parse_memories(&md);
-                    if items.is_empty() {
-                        fail("no top-level list items found in memories file");
-                    }
-                    (md, items)
+                    let fmt = match format.as_deref() {
+                        Some(f) => f.to_string(),
+                        None => match mem.extension().and_then(|e| e.to_str()) {
+                            Some("jsonl") => "jsonl".to_string(),
+                            _ => "md".to_string(),
+                        },
+                    };
+                    let items = match fmt.as_str() {
+                        "md" => {
+                            let items = parse_memories(&src);
+                            if items.is_empty() {
+                                fail("no top-level list items found in memories file");
+                            }
+                            items
+                        }
+                        "jsonl" => {
+                            let items = parse_memories_jsonl(&src).unwrap_or_else(|e| {
+                                fail(format!("parse {}: {e}", mem.display()))
+                            });
+                            if items.is_empty() {
+                                fail("no memories found in jsonl file");
+                            }
+                            items
+                        }
+                        other => fail(format!("unknown --format '{other}': use md or jsonl")),
+                    };
+                    (src, items)
                 }
                 (None, Some(feed)) => {
                     let src = fs::read_to_string(feed)
@@ -1356,6 +1414,31 @@ mod tests {
         for (parsed, line) in items.iter().zip(raw.iter()) {
             assert_eq!(alnum(parsed), alnum(&line[2..]));
         }
+    }
+
+    #[test]
+    fn jsonl_preserves_bodies_byte_exact() {
+        let src = concat!(
+            "{\"ts_pt\": \"2026-09-17 18:34\", \"body\": \":) keep breathing.\\n\\nsecond para  \"}\n",
+            "{\"ts_pt\": \"2026-09-17 18:36\", \"body\": \"- not a list item, just my words\"}\n",
+            "{\"body\": \"no timestamp, still mine — curly ’ quotes\"}\n",
+            "\n",
+            "{\"ts_pt\": \"2026-09-17 18:38\", \"body\": \"   leading spaces kept\"}\n"
+        );
+        let items = parse_memories_jsonl(src).expect("valid jsonl");
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], "[2026-09-17 18:34 PT] :) keep breathing.\n\nsecond para  ");
+        assert_eq!(items[1], "[2026-09-17 18:36 PT] - not a list item, just my words");
+        assert_eq!(items[2], "no timestamp, still mine — curly ’ quotes");
+        assert_eq!(items[3], "[2026-09-17 18:38 PT]    leading spaces kept");
+    }
+
+    #[test]
+    fn jsonl_rejects_malformed_lines_loudly() {
+        let err = parse_memories_jsonl("{\"body\": \"fine\"}\nnot json\n").unwrap_err();
+        assert!(err.contains("line 2"), "got: {err}");
+        let err = parse_memories_jsonl("{\"ts_pt\": \"2026-01-01 00:00\"}\n").unwrap_err();
+        assert!(err.contains("body"), "got: {err}");
     }
 
     #[test]
