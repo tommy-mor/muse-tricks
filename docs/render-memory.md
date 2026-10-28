@@ -30,6 +30,14 @@ gardeners, the user) and carries material the sorter knows nothing about.
    half-written MEMORY.md.
 6. **Multiple scopes coexist.** Each scope gets its own region; rendering
    one never disturbs another.
+7. **Only the largest connected component is a ranking.** The region
+   renders the scope's largest connected component of voted pairs,
+   ranked on its own induced subgraph — never whole-pool scores. Items
+   with no votes are *undefined*: they are not seated at a prior, not
+   counted in the header's "top N of M" (M is the component's size),
+   and never appear. Smaller components likewise wait outside until
+   the dealer bridges them in. If no vote has landed yet, the region
+   renders empty: `top 0 of 0`.
 
 ## What the tool deliberately does not do
 
