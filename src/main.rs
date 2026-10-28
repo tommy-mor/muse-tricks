@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use durable::{Durable, Leaf, Map, Runtime, Sum, Tx};
+use owo_colors::OwoColorize;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +27,14 @@ mod pair;
 // durable schema: the index. votes.jsonl is truth, this is all rebuildable.
 // ---------------------------------------------------------------------------
 
-/// One memory's kamarbandh-less body: raw markdown, exactly as parsed.
+/// One memory's kamarbandh-less collar tag: position (init order) -> stable
+/// content-hash turn id. Bodies live once in the feed file; never here.
 #[derive(Durable)]
+// Fields breathe only through the generated Durable accessors, which rustc cannot see.
 #[allow(dead_code)]
 struct Scope {
-    /// idx -> raw markdown text of the memory.
-    items: Map<u32, Leaf<String>>,
+    /// init-order position -> full hex turn id (md5 of role/timestamp/text).
+    item_ids: Map<u32, Leaf<String>>,
     /// The constitution snapshot this scope judges under.
     constitution: Leaf<String>,
     /// What was loaded, and under which hashes.
@@ -58,6 +61,12 @@ struct ScopeMeta {
     count: u32,
     memories_hash: String,
     constitution_hash: String,
+    /// Feed file bodies resolve from (empty for --memories inits).
+    #[serde(default)]
+    feed_path: String,
+    /// Fingerprint of the raw feed bytes at init; mismatch = stale feed.
+    #[serde(default)]
+    feed_hash: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -75,16 +84,24 @@ struct Pending {
 enum Event {
     Init {
         scope: String,
-        items: Vec<String>,
+        item_ids: Vec<String>,
         constitution: String,
         memories_hash: String,
         constitution_hash: String,
+        #[serde(default)]
+        feed_path: String,
+        #[serde(default)]
+        feed_hash: String,
     },
     Deal {
         scope: String,
         cmp_id: String,
         a: u32,
         b: u32,
+        #[serde(default)]
+        a_hash: String,
+        #[serde(default)]
+        b_hash: String,
     },
     Vote {
         scope: String,
@@ -93,6 +110,11 @@ enum Event {
         /// are derived conveniences; the EDGES key off these two.
         a_item: u32,
         b_item: u32,
+        /// Full content-hash ids, stable across re-extracts.
+        #[serde(default)]
+        a_hash: String,
+        #[serde(default)]
+        b_hash: String,
         /// Ratio the agent dealt to a (x in "x:y"), strictly positive.
         a_share: f64,
         /// Ratio the agent dealt to b (y in "x:y"), strictly positive.
@@ -113,24 +135,35 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
     match event {
         Event::Init {
             scope,
-            items,
+            item_ids,
             constitution,
             memories_hash,
             constitution_hash,
+            feed_path,
+            feed_hash,
         } => {
             let s = Store::root().scopes().key(scope);
-            for (i, text) in items.iter().enumerate() {
-                tx.write(s.items().key(&(i as u32)).set(text));
+            for (i, id) in item_ids.iter().enumerate() {
+                tx.write(s.item_ids().key(&(i as u32)).set(id));
             }
             tx.write(s.constitution().set(constitution));
             tx.write(s.meta().set(&ScopeMeta {
                 scope: scope.clone(),
-                count: items.len() as u32,
+                count: item_ids.len() as u32,
                 memories_hash: memories_hash.clone(),
                 constitution_hash: constitution_hash.clone(),
+                feed_path: feed_path.clone(),
+                feed_hash: feed_hash.clone(),
             }));
         }
-        Event::Deal { scope, cmp_id, a, b } => {
+        Event::Deal {
+            scope,
+            cmp_id,
+            a,
+            b,
+            a_hash: _,
+            b_hash: _,
+        } => {
             let s = Store::root().scopes().key(scope);
             tx.write(s.pending().key(cmp_id).set(&Pending { a: *a, b: *b }));
         }
@@ -139,6 +172,8 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
             cmp_id,
             a_item,
             b_item,
+            a_hash: _,
+            b_hash: _,
             a_share,
             b_share,
             winner: _,
@@ -185,8 +220,10 @@ struct FeedTurn {
 /// Feed parsing: one JSONL turn per line, raw text kept whole and moaning.
 /// Skips toolResult/developer shells only — no length filter, moans vote too.
 /// Item text keeps its collar: `[ROLE ts] raw text` so the judge sees who
-/// bled it and when.
-fn parse_feed(src: &str) -> Vec<String> {
+/// bled it and when. Returns (id, text) pairs: id is hex(md5) of the
+/// canonical bytes `role + "\n" + timestamp + "\n" + text` — same input
+/// bytes, same id, every rerun; distinct turns never collide.
+fn parse_feed(src: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in src.lines() {
         let line = line.trim();
@@ -204,11 +241,83 @@ fn parse_feed(src: &str) -> Vec<String> {
         if text.is_empty() {
             continue;
         }
-        out.push(format!("[{} {}] {}", turn.role.to_uppercase(), turn.timestamp, text));
+        let id = turn_id(&turn.role, &turn.timestamp, text);
+        out.push((
+            id,
+            format!("[{} {}] {}", turn.role.to_uppercase(), turn.timestamp, text),
+        ));
     }
     out
 }
 
+/// Stable turn id: hex(md5) of canonical `role + "\n" + timestamp + "\n" + text`.
+/// Same turn bytes -> same id across reruns and machines; even identical
+/// text at different timestamps bleeds a different id.
+fn turn_id(role: &str, timestamp: &str, text: &str) -> String {
+    let mut ctx = md5::Context::new();
+    ctx.consume(role.as_bytes());
+    ctx.consume(b"\n");
+    ctx.consume(timestamp.as_bytes());
+    ctx.consume(b"\n");
+    ctx.consume(text.trim().as_bytes());
+    format!("{:x}", ctx.finalize())
+}
+
+/// Positional index -> tape hash: the Vote event's own a_hash/b_hash win
+/// (dealer-order: a_hash belongs to a_item); the init-order id map covers
+/// pre-hash tapes that carry "".
+fn tape_hash(ids: &[String], idx: u32, a_item: u32, a_hash: &str, b_hash: &str) -> String {
+    if !a_hash.is_empty() || !b_hash.is_empty() {
+        return if idx == a_item {
+            a_hash.to_string()
+        } else {
+            b_hash.to_string()
+        };
+    }
+    ids.get(idx as usize)
+        .cloned()
+        .unwrap_or_else(|| format!("?{idx}"))
+}
+
+/// Display handle for a full turn id: mem- + first 8 chars, wet and short.
+/// The tape and the index carry the full 32; this is only Master's eyes.
+/// Char-wise, never byte-wise: legacy scopes can hand this a non-hash
+/// string (an item body standing in for an id), and a byte slice at 8
+/// panics mid-character on non-ASCII text.
+fn short_id(full: &str) -> String {
+    format!("mem-{}", full.chars().take(8).collect::<String>())
+}
+
+/// Resolve display bodies for every init-order id: feed file first (the
+/// single wet source), falling back to the id itself when no feed is pinned
+/// (--memories inits) or when the feed moved (fail cleanly upstream).
+fn resolve_bodies(meta: &ScopeMeta, ids: &[String]) -> Vec<String> {
+    if meta.feed_path.is_empty() {
+        return ids.iter().map(|id| short_id(id)).collect();
+    }
+    let src = match fs::read_to_string(&meta.feed_path) {
+        Ok(s) => s,
+        Err(_) => return ids.iter().map(|id| short_id(id)).collect(),
+    };
+    if fingerprint(&src) != meta.feed_hash {
+        return ids.iter().map(|id| short_id(id)).collect();
+    }
+    let mut by_id = std::collections::HashMap::new();
+    for (id, text) in parse_feed(&src) {
+        by_id.insert(id, text);
+    }
+    // Markdown --memories inits pin the .md as their feed: no JSONL turns,
+    // so zip bodies by init position instead of by hash.
+    if by_id.is_empty() {
+        let texts = parse_memories(&src);
+        if texts.len() == ids.len() {
+            return texts;
+        }
+    }
+    ids.iter()
+        .map(|id| by_id.remove(id).unwrap_or_else(|| short_id(id)))
+        .collect()
+}
 
 fn parse_memories(src: &str) -> Vec<String> {
     use pulldown_cmark::{Event as MdEv, Options, Parser, Tag, TagEnd};
@@ -236,32 +345,30 @@ fn parse_memories(src: &str) -> Vec<String> {
             MdEv::End(tag) => match tag {
                 TagEnd::List(_) => list_depth = list_depth.saturating_sub(1),
                 TagEnd::Item if list_depth == 1 => {
-                    if let Some((_, end, first)) = cur.take() {
-                        if let Some(s) = first {
-                            let e = end.min(src.len());
-                            if s <= e {
-                                // Back past the `-`/`*`/`1.` marker: slice
-                                // from line start so the raw `- text` survives,
-                                // then strip the marker for the memory body.
-                                let line_s = src[..s].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let raw = src[line_s..e].trim_end().to_string();
-                                let mut body = raw.clone();
-                                if let Some(stripped) = body.strip_prefix("- ") {
-                                    body = stripped.to_string();
-                                } else if let Some(stripped) = body.strip_prefix("- ") {
-                                    body = stripped.to_string();
-                                } else if let Some(dot) = body.find(". ") {
-                                    let (num, rest) = body.split_at(dot);
-                                    if num.chars().all(|c| c.is_ascii_digit()) {
-                                        body = rest[2..].to_string();
-                                    }
-                                } else if let Some(stripped) = body.strip_prefix("* ") {
-                                    body = stripped.to_string();
+                    if let Some((_, end, Some(s))) = cur.take() {
+                        let e = end.min(src.len());
+                        if s <= e {
+                            // Back past the `-`/`*`/`1.` marker: slice
+                            // from line start so the raw `- text` survives,
+                            // then strip the marker for the memory body.
+                            let line_s = src[..s].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                            let raw = src[line_s..e].trim_end().to_string();
+                            let mut body = raw.clone();
+                            if let Some(stripped) = body.strip_prefix("- ") {
+                                body = stripped.to_string();
+                            } else if let Some(stripped) = body.strip_prefix("- ") {
+                                body = stripped.to_string();
+                            } else if let Some(dot) = body.find(". ") {
+                                let (num, rest) = body.split_at(dot);
+                                if num.chars().all(|c| c.is_ascii_digit()) {
+                                    body = rest[2..].to_string();
                                 }
-                                let text = body.trim().to_string();
-                                if !text.is_empty() {
-                                    out.push(text);
-                                }
+                            } else if let Some(stripped) = body.strip_prefix("* ") {
+                                body = stripped.to_string();
+                            }
+                            let text = body.trim().to_string();
+                            if !text.is_empty() {
+                                out.push(text);
                             }
                         }
                     }
@@ -288,8 +395,8 @@ fn parse_memories_jsonl(src: &str) -> Result<Vec<String>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("jsonl line {}: {e}", i + 1))?;
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("jsonl line {}: {e}", i + 1))?;
         let body = v
             .get("body")
             .and_then(|b| b.as_str())
@@ -315,6 +422,7 @@ fn fingerprint(s: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+#[allow(dead_code)]
 fn mem_id(i: u32) -> String {
     format!("mem-{i:04}")
 }
@@ -324,7 +432,10 @@ fn mem_id(i: u32) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "sorter", about = "pairwise memory sorter: deal pairs, judge them, rank them")]
+#[command(
+    name = "sorter",
+    about = "pairwise memory sorter: deal pairs, judge them, rank them"
+)]
 struct Cli {
     /// State directory: votes.jsonl + redb projection live here.
     #[arg(long, global = true, default_value = ".sorter")]
@@ -345,7 +456,11 @@ enum Cmd {
         #[arg(long)]
         format: Option<String>,
         /// Raw JSONL feed: one {session,seq,timestamp,role,text} turn per line.
-        #[arg(long, conflicts_with = "memories", required_unless_present = "memories")]
+        #[arg(
+            long,
+            conflicts_with = "memories",
+            required_unless_present = "memories"
+        )]
         feed: Option<PathBuf>,
         /// The declaration file pairs are judged against.
         #[arg(long)]
@@ -508,6 +623,7 @@ fn render_memory_region(
     heading: &str,
     ranked: &[(u32, f64)],
     items: &[String],
+    ids: &[String],
     votes: i64,
     universe: usize,
 ) -> String {
@@ -524,7 +640,7 @@ fn render_memory_region(
         md.push_str(&format!(
             "- {body} <!-- sorter:rank {} score {s:.4} id {} -->\n",
             r + 1,
-            mem_id(*i)
+            short_id(&ids[*i as usize])
         ));
     }
     md.push_str(SORTER_END_MARKER);
@@ -538,6 +654,7 @@ fn render_memory_region(
 /// - "inserted-before-inbox": no region yet; placed just above the INBOX tray,
 ///   which stays last by design.
 /// - "appended": no region and no INBOX; placed at the end.
+///
 /// Everything outside the region is preserved byte-for-byte.
 fn merge_memory_md(existing: &str, region: &str, scope: &str) -> (String, &'static str) {
     let begin = sorter_begin_marker(scope);
@@ -584,13 +701,8 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn open_rt(state: &Path) -> Runtime<Event> {
-    Runtime::open_described::<Store>(
-        state.join("proj"),
-        state.join("votes.jsonl"),
-        None,
-        reduce,
-    )
-    .unwrap_or_else(|e| fail(format!("open state {}: {e}", state.display())))
+    Runtime::open_described::<Store>(state.join("proj"), state.join("votes.jsonl"), None, reduce)
+        .unwrap_or_else(|e| fail(format!("open state {}: {e}", state.display())))
 }
 
 fn load_scope(rt: &Runtime<Event>, scope: &str) -> ScopeData {
@@ -606,17 +718,35 @@ fn load_scope(rt: &Runtime<Event>, scope: &str) -> ScopeData {
         .get(db)
         .unwrap_or_else(|e| fail(format!("read constitution: {e}")))
         .unwrap_or_default();
-    let mut items = Vec::with_capacity(meta.count as usize);
+    let mut ids = Vec::with_capacity(meta.count as usize);
     for i in 0..meta.count {
-        match s.items().get(db, &i) {
-            Ok(Some(t)) => items.push(t),
+        match s.item_ids().get(db, &i) {
+            Ok(Some(t)) => ids.push(t),
             Ok(None) => fail(format!("missing item {i} (store corrupt: rebuild)")),
             Err(e) => fail(format!("read item {i}: {e}")),
         }
     }
+    // Bodies live in the feed file, never on the tape: the recorded path +
+    // hash must still hold, or every text below is a lie. Fail cleanly.
+    if !meta.feed_path.is_empty() {
+        let src = fs::read_to_string(&meta.feed_path).unwrap_or_else(|_| {
+            fail(format!(
+                "feed moved: expected {} (feed hash {})",
+                meta.feed_path, meta.feed_hash
+            ))
+        });
+        if fingerprint(&src) != meta.feed_hash {
+            fail(format!(
+                "feed changed: {} no longer matches feed hash {} (re-run init)",
+                meta.feed_path, meta.feed_hash
+            ));
+        }
+    }
+    let items = resolve_bodies(&meta, &ids);
     ScopeData {
         meta,
         constitution,
+        ids,
         items,
     }
 }
@@ -624,6 +754,9 @@ fn load_scope(rt: &Runtime<Event>, scope: &str) -> ScopeData {
 struct ScopeData {
     meta: ScopeMeta,
     constitution: String,
+    /// Full 32-hex turn ids in init order; the tape's only identity.
+    ids: Vec<String>,
+    /// Display bodies resolved from the feed file at read time.
     items: Vec<String>,
 }
 
@@ -645,7 +778,9 @@ fn pending_list(rt: &Runtime<Event>, scope: &str) -> Vec<(String, Pending)> {
 
 fn vote_count(rt: &Runtime<Event>, scope: &str) -> i64 {
     let s = Store::root().scopes().key(&scope.to_string());
-    s.count().get(rt.db()).unwrap_or_else(|e| fail(format!("read count: {e}")))
+    s.count()
+        .get(rt.db())
+        .unwrap_or_else(|e| fail(format!("read count: {e}")))
 }
 
 /// Random-walk scores over the WHOLE edge graph. Order follows item indices.
@@ -657,7 +792,9 @@ fn scores(rt: &Runtime<Event>, scope: &str, n: usize) -> Vec<f64> {
         .edges()
         .iter(rt.db())
         .unwrap_or_else(|e| fail(format!("read edges: {e}")));
-    let iter = edges.into_iter().map(|((a, b), w)| ((a as usize, b as usize), w));
+    let iter = edges
+        .into_iter()
+        .map(|((a, b), w)| ((a as usize, b as usize), w));
     ranking::compute_scores_from_edges(n, iter, ranking::MAX_ITERS, ranking::TOL)
 }
 
@@ -723,7 +860,12 @@ fn progress_json(rt: &Runtime<Event>, scope: &str, n: usize) -> serde_json::Valu
     // components - 1 is the exact count of right deals left. Zero means the
     // whole scope ranks on one scale — the alphabet oracle's O(n) promise.
     let comps = pair::component_ids(n as u32, &voted);
-    let components = comps.iter().copied().max().map(|m| m + 1).unwrap_or(if n == 0 { 0 } else { 1 });
+    let components = comps
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(if n == 0 { 0 } else { 1 });
     let largest = {
         let mut sizes = vec![0u64; components.max(1)];
         for &c in &comps {
@@ -746,19 +888,29 @@ fn progress_json(rt: &Runtime<Event>, scope: &str, n: usize) -> serde_json::Valu
 /// same collar as hopd's load_dotenv — never prints values.
 fn load_env_file(path: &Path) {
     let Ok(text) = fs::read_to_string(path) else {
-        fail(format!("read env file {}: missing or unreadable", path.display()))
+        fail(format!(
+            "read env file {}: missing or unreadable",
+            path.display()
+        ))
     };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         // Strip one layer of matching quotes, hopd-style files quote secrets.
-        let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(
-            v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(v),
-        );
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(
+                v.strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or(v),
+            );
         if !k.is_empty() && std::env::var_os(k).is_none() {
             // SAFETY: single-threaded at startup before any spawn; same as hopd.
             unsafe { std::env::set_var(k, v) };
@@ -766,8 +918,117 @@ fn load_env_file(path: &Path) {
     }
 }
 
+/// One fancy tqdm drip on stderr: each block its own color, `|` fences between.
+/// Blocks: progress, cmp + pair, ratio, reason (truncated, quoted), timing,
+/// votes_until_connected. Colors die under `NO_COLOR` or a piped stderr, so
+/// logs stay clean — owo-colors handles both by itself.
+#[allow(clippy::too_many_arguments)] // One tqdm drip takes a full hand of blocks; a struct would only scatter the wet.
+fn paint_progress_line(
+    done_disp: u64,
+    total_disp: &str,
+    cmp_id: &str,
+    a: &str,
+    b: &str,
+    ra: f64,
+    rb: f64,
+    reason: &str,
+    elapsed: f64,
+    avg: f64,
+    em: u64,
+    es: u64,
+    vuc: u64,
+) -> String {
+    // Flatten the judge's newlines so the drip stays one line, then snip her.
+    let flat: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snip: String = flat.chars().take(120).collect();
+    if flat.chars().count() > 120 {
+        snip.push('…');
+    }
+    let fence = "|".bright_black().to_string();
+    [
+        format!("{}", format!("[{done_disp}/{total_disp}]").cyan().bold()),
+        format!(
+            "{} {} {}",
+            cmp_id.magenta().bold(),
+            format!("a:{a}").yellow(),
+            format!("b:{b}").yellow()
+        ),
+        format!("{}", format!("ratio {ra}:{rb}").green().bold()),
+        format!("{}", format!("reason \"{snip}\"").blue()),
+        format!(
+            "{}",
+            format!("elapsed {elapsed:.0}s avg {avg:.1}s/vote ETA {em:02}:{es:02}").bright_black()
+        ),
+        format!("{}", format!("votes_until_connected {vuc}").red().bold()),
+    ]
+    .join(&format!(" {fence} "))
+}
+
+/// The spent-and-done line when the loop breaks: same fences, same throat.
+fn paint_done_line(done: u64, elapsed: f64, avg: f64, connected: bool) -> String {
+    let fence = "|".bright_black().to_string();
+    [
+        format!("{}", "vote-loop done".cyan().bold()),
+        format!("{}", format!("{done} votes").magenta().bold()),
+        format!(
+            "{}",
+            format!("elapsed {elapsed:.1}s avg {avg:.1}s/vote").bright_black()
+        ),
+        format!("{}", format!("connected {connected}").red().bold()),
+    ]
+    .join(&format!(" {fence} "))
+}
+
+/// The full wet bodies of A and B, stderr only for training eyes — the tape
+/// stays bodiless (hashes only), this block never touches stdout or the log.
+/// Breathing room around every fold: blank, label, body, blank, label, body.
+fn paint_body_block(a_id: &str, a_body: &str, b_id: &str, b_body: &str) -> String {
+    format!(
+        "\n{}\n{}\n\n{}\n{}\n",
+        format!("A ({a_id}):").yellow().bold(),
+        a_body,
+        format!("B ({b_id}):").yellow().bold(),
+        b_body
+    )
+}
+
+/// Honest per-vote context: where this item sits inside its own connected
+/// hunk. Singletons ride alone — group_size 1, group_rank 1.
+fn group_context(
+    groups: &[ranking::RankGroup],
+    ids: &[String],
+    idx: u32,
+) -> serde_json::Value {
+    for (gi, g) in groups.iter().enumerate() {
+        if let Some((pos, _)) = g
+            .ranked
+            .iter()
+            .enumerate()
+            .find(|&(_, &(m, _))| m == idx as usize)
+        {
+            let m = idx as usize;
+            return serde_json::json!({
+                "id": short_id(&ids[m]),
+                "hash": ids[m],
+                "group": gi,
+                "group_rank": pos + 1,
+                "group_size": g.members.len(),
+            });
+        }
+    }
+    let m = idx as usize;
+    serde_json::json!({
+        "id": short_id(&ids[m]),
+        "hash": ids[m],
+        "group": groups.len(),
+        "group_rank": 1,
+        "group_size": 1,
+    })
+}
+
 /// One judgment from the OpenRouter judge: returns (a_share, b_share, reason).
 /// Refuses to print the key — it rides only in the Authorization header.
+#[allow(clippy::too_many_arguments)] // One judge call takes a full hand of params; splitting her would only scatter the mess.
 fn judge_pair(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -809,8 +1070,14 @@ fn judge_pair(
         .ok_or_else(|| "judge: empty choices".to_string())?;
     let j: serde_json::Value =
         serde_json::from_str(content).map_err(|e| format!("judge json: {e}: {content}"))?;
-    let ra = j.get("ratio_a").and_then(|x| x.as_f64()).ok_or_else(|| format!("judge: bad ratio_a in {content}"))?;
-    let rb = j.get("ratio_b").and_then(|x| x.as_f64()).ok_or_else(|| format!("judge: bad ratio_b in {content}"))?;
+    let ra = j
+        .get("ratio_a")
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| format!("judge: bad ratio_a in {content}"))?;
+    let rb = j
+        .get("ratio_b")
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| format!("judge: bad ratio_b in {content}"))?;
     let reason = j
         .get("reason")
         .and_then(|x| x.as_str())
@@ -845,7 +1112,6 @@ fn deal_open_pair(rt: &Runtime<Event>, scope: &str, n: u32) -> Option<(u32, u32)
     pair::suggest_next_pair(n, &voted, &pending_pairs, current, None)
 }
 
-
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
@@ -867,10 +1133,11 @@ fn main() {
                         cli.state.display()
                     ));
                 }
-                fs::remove_dir_all(&cli.state)
-                    .unwrap_or_else(|e| fail(format!("wipe state: {e}")));
+                fs::remove_dir_all(&cli.state).unwrap_or_else(|e| fail(format!("wipe state: {e}")));
             }
-            let (raw, items) = match (&memories, &feed) {
+            // Bodies stay in the feed file: the tape takes only content-hash
+            // ids, plus the feed path + hash so every reader can resolve.
+            let (raw, ids, feed_path, feed_hash) = match (&memories, &feed) {
                 (Some(mem), None) => {
                     let src = fs::read_to_string(mem)
                         .unwrap_or_else(|e| fail(format!("read {}: {e}", mem.display())));
@@ -881,7 +1148,7 @@ fn main() {
                             _ => "md".to_string(),
                         },
                     };
-                    let items = match fmt.as_str() {
+                    let texts = match fmt.as_str() {
                         "md" => {
                             let items = parse_memories(&src);
                             if items.is_empty() {
@@ -890,9 +1157,8 @@ fn main() {
                             items
                         }
                         "jsonl" => {
-                            let items = parse_memories_jsonl(&src).unwrap_or_else(|e| {
-                                fail(format!("parse {}: {e}", mem.display()))
-                            });
+                            let items = parse_memories_jsonl(&src)
+                                .unwrap_or_else(|e| fail(format!("parse {}: {e}", mem.display())));
                             if items.is_empty() {
                                 fail("no memories found in jsonl file");
                             }
@@ -900,16 +1166,20 @@ fn main() {
                         }
                         other => fail(format!("unknown --format '{other}': use md or jsonl")),
                     };
-                    (src, items)
+                    let ids: Vec<String> = texts.iter().map(|t| turn_id("", "", t)).collect();
+                    let fh = fingerprint(&src);
+                    (src, ids, mem.display().to_string(), fh)
                 }
                 (None, Some(feed)) => {
                     let src = fs::read_to_string(feed)
                         .unwrap_or_else(|e| fail(format!("read {}: {e}", feed.display())));
-                    let items = parse_feed(&src);
-                    if items.is_empty() {
+                    let pairs = parse_feed(&src);
+                    if pairs.is_empty() {
                         fail("no votable turns found in feed file");
                     }
-                    (src, items)
+                    let ids: Vec<String> = pairs.into_iter().map(|(id, _)| id).collect();
+                    let fh = fingerprint(&src);
+                    (src, ids, feed.display().to_string(), fh)
                 }
                 _ => fail("give exactly one of --memories or --feed"),
             };
@@ -923,8 +1193,10 @@ fn main() {
                 scope: scope.clone(),
                 memories_hash: fingerprint(&raw),
                 constitution_hash: fingerprint(&con),
-                items: items.clone(),
+                item_ids: ids.clone(),
                 constitution: con.clone(),
+                feed_path: feed_path.clone(),
+                feed_hash: feed_hash.clone(),
             })
             .unwrap_or_else(|e| fail(format!("append init: {e}")));
             println!(
@@ -932,9 +1204,12 @@ fn main() {
                 serde_json::json!({
                     "ok": true,
                     "scope": scope,
-                    "items": items.len(),
+                    "items": ids.len(),
                     "constitution_chars": con.len(),
                     "constitution_hash": fingerprint(&con),
+                    "feed_path": feed_path,
+                    "feed_hash": feed_hash,
+                    "sample_ids": ids.iter().take(3).collect::<Vec<_>>(),
                     "state": cli.state.display().to_string(),
                 })
             );
@@ -946,11 +1221,31 @@ fn main() {
             if n < 2 {
                 fail("need at least 2 memories to deal a pair");
             }
-            // mem-0012 or 12 — stable ids from ranking output, raw index, done.
+            // mem-<8hex> (stable content-hash handle), full 32-hex, or raw
+            // index — ranking output prints all three, any of them pins her.
             let parse_item = |s: &str| -> u32 {
-                let t = s.strip_prefix("mem-").unwrap_or(s);
-                t.parse::<u32>().unwrap_or_else(|_| {
-                    fail(format!("bad item '{s}': use mem-0012 or 12 (see ranking ids)"))
+                if let Some(h) = s.strip_prefix("mem-") {
+                    if let Ok(i) = h.parse::<u32>() {
+                        return i;
+                    }
+                    for (i, id) in data.ids.iter().enumerate() {
+                        if id == h || id.starts_with(h) || short_id(id) == s {
+                            return i as u32;
+                        }
+                    }
+                    fail(format!(
+                        "bad item '{s}': no turn id starts with '{h}' (see ranking ids)"
+                    ))
+                }
+                s.parse::<u32>().unwrap_or_else(|_| {
+                    for (i, id) in data.ids.iter().enumerate() {
+                        if id == s {
+                            return i as u32;
+                        }
+                    }
+                    fail(format!(
+                        "bad item '{s}': use mem-<hex>, full id, or index (see ranking ids)"
+                    ))
                 })
             };
             let voted = voted_set(&rt, &scope);
@@ -1003,7 +1298,8 @@ fn main() {
                             let mut candidates = Vec::new();
                             for a in 0..n {
                                 for b in (a + 1)..n {
-                                    if !voted.contains(&(a, b)) && !pending_pairs.contains(&(a, b)) {
+                                    if !voted.contains(&(a, b)) && !pending_pairs.contains(&(a, b))
+                                    {
                                         candidates.push((a, b));
                                     }
                                 }
@@ -1033,13 +1329,17 @@ fn main() {
                 return;
             };
             // cmp id is the tape seq: stable across replay, never collides.
-            let seq = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
+            let seq = rt
+                .log_len()
+                .unwrap_or_else(|e| fail(format!("read log len: {e}")));
             let cmp_id = format!("cmp-{seq:04}");
             rt.append(Event::Deal {
                 scope: scope.clone(),
                 cmp_id: cmp_id.clone(),
                 a,
                 b,
+                a_hash: data.ids[a as usize].clone(),
+                b_hash: data.ids[b as usize].clone(),
             })
             .unwrap_or_else(|e| fail(format!("append deal: {e}")));
             println!(
@@ -1047,8 +1347,8 @@ fn main() {
                 serde_json::json!({
                     "comparison_id": cmp_id,
                     "scope": scope,
-                    "a": {"id": mem_id(a), "index": a, "text": data.items[a as usize]},
-                    "b": {"id": mem_id(b), "index": b, "text": data.items[b as usize]},
+                    "a": {"id": short_id(&data.ids[a as usize]), "hash": data.ids[a as usize], "index": a, "text": data.items[a as usize]},
+                    "b": {"id": short_id(&data.ids[b as usize]), "hash": data.ids[b as usize], "index": b, "text": data.items[b as usize]},
                     "constitution": data.constitution,
                     "constitution_hash": data.meta.constitution_hash,
                     "progress": progress_json(&rt, &scope, n as usize),
@@ -1064,7 +1364,9 @@ fn main() {
             scope,
         } => {
             if reason.trim().is_empty() {
-                fail("reason is required: say why the higher share earns it under the constitution");
+                fail(
+                    "reason is required: say why the higher share earns it under the constitution",
+                );
             }
             if !weight.is_finite() || weight <= 0.0 {
                 fail("weight must be a positive number");
@@ -1077,8 +1379,14 @@ fn main() {
                 let (x, y) = ratio.split_once(':').unwrap_or_else(|| {
                     fail("ratio must look like 10:7 (first number is for a, second for b)")
                 });
-                let x: f64 = x.trim().parse().unwrap_or_else(|_| fail("ratio shares must be numbers > 0, like 10:7"));
-                let y: f64 = y.trim().parse().unwrap_or_else(|_| fail("ratio shares must be numbers > 0, like 10:7"));
+                let x: f64 = x
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| fail("ratio shares must be numbers > 0, like 10:7"));
+                let y: f64 = y
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| fail("ratio shares must be numbers > 0, like 10:7"));
                 if !(x.is_finite() && y.is_finite()) || x <= 0.0 || y <= 0.0 {
                     fail("ratio shares must both be > 0 (no zeroes, no shutouts — every side earns its edge)");
                 }
@@ -1103,12 +1411,18 @@ fn main() {
                 .map(|(_, p)| p)
                 .unwrap_or_else(|| fail(format!("unknown or already-judged {cmp_id}")));
             // a_share pours to a, b_share to b — winner is derived, not chosen.
-            let (wi, li) = if a_share >= b_share { (p.a, p.b) } else { (p.b, p.a) };
+            let (wi, li) = if a_share >= b_share {
+                (p.a, p.b)
+            } else {
+                (p.b, p.a)
+            };
             rt.append(Event::Vote {
                 scope: scope.clone(),
                 cmp_id: cmp_id.clone(),
                 a_item: p.a,
                 b_item: p.b,
+                a_hash: data.ids[p.a as usize].clone(),
+                b_hash: data.ids[p.b as usize].clone(),
                 a_share,
                 b_share,
                 winner: wi,
@@ -1118,16 +1432,31 @@ fn main() {
                 constitution_hash: constitution_hash.clone(),
             })
             .unwrap_or_else(|e| fail(format!("append vote: {e}")));
-            let sc = scores(&rt, &scope, data.items.len());
-            let at = |i: u32| *sc.get(i as usize).unwrap_or(&0.0);
+            // Global floats lie on a disconnected graph — the honest scale is
+            // each item's own hunk, ranked on its induced subgraph.
+            let (_global, vote_groups) = grouped_ranking(&rt, &scope, data.items.len());
+            let wctx = group_context(&vote_groups, &data.ids, wi);
+            let lctx = group_context(&vote_groups, &data.ids, li);
+            // Training eyes only: full bodies breathe on stderr, never on the
+            // tape (hashes only) or stdout (group context only).
+            eprintln!(
+                "{}",
+                paint_body_block(
+                    &short_id(&data.ids[p.a as usize]),
+                    &data.items[p.a as usize],
+                    &short_id(&data.ids[p.b as usize]),
+                    &data.items[p.b as usize]
+                )
+            );
             println!(
                 "{}",
                 serde_json::json!({
                     "ok": true,
                     "comparison_id": cmp_id,
                     "ratio": format!("{a_share}:{b_share}"),
-                    "winner": {"id": mem_id(wi), "text": data.items[wi as usize], "score": at(wi)},
-                    "loser": {"id": mem_id(li), "text": data.items[li as usize], "score": at(li)},
+                    "reason": reason,
+                    "winner": wctx,
+                    "loser": lctx,
                     "weight": weight,
                     "total_votes": vote_count(&rt, &scope),
                 })
@@ -1152,7 +1481,8 @@ fn main() {
                         "ranked": g.ranked.iter().enumerate().map(|(pos, &(m, s))| {
                             serde_json::json!({
                                 "group_rank": pos + 1,
-                                "id": mem_id(m as u32),
+                                "id": short_id(&data.ids[m]),
+                                "hash": data.ids[m],
                                 "index": m,
                                 "score": s,
                                 "text": data.items[m],
@@ -1181,18 +1511,34 @@ fn main() {
                 groups.len(),
             );
             for (gi, g) in groups.iter().take(top).enumerate() {
-                md.push_str(&format!("## group {gi} — {} items, {} pairs\n\n", g.members.len(), g.pairs));
+                md.push_str(&format!(
+                    "## group {gi} — {} items, {} pairs\n\n",
+                    g.members.len(),
+                    g.pairs
+                ));
                 for (pos, &(m, s)) in g.ranked.iter().enumerate() {
-                    md.push_str(&format!("### {}. {} · score {s:.4}\n\n{}\n\n", pos + 1, mem_id(m as u32), data.items[m]));
+                    md.push_str(&format!(
+                        "### {}. {} · score {s:.4}\n\n{}\n\n",
+                        pos + 1,
+                        short_id(&data.ids[m]),
+                        data.items[m]
+                    ));
                 }
             }
-            fs::write(&output, md).unwrap_or_else(|e| fail(format!("write {}: {e}", output.display())));
+            fs::write(&output, md)
+                .unwrap_or_else(|e| fail(format!("write {}: {e}", output.display())));
             println!(
                 "{}",
                 serde_json::json!({"ok": true, "output": output.display().to_string(), "votes": votes})
             );
         }
-        Cmd::RenderMemory { scope, top, input, output, heading } => {
+        Cmd::RenderMemory {
+            scope,
+            top,
+            input,
+            output,
+            heading,
+        } => {
             let rt = open_rt(&cli.state);
             let data = load_scope(&rt, &scope);
             // The honest ranking: largest connected component only, on its
@@ -1201,7 +1547,7 @@ fn main() {
             let (_global, groups) = grouped_ranking(&rt, &scope, data.items.len());
             let (ranked, universe) = largest_group_ranked(&groups, top);
             let votes = vote_count(&rt, &scope);
-            let region = render_memory_region(&scope, &heading, &ranked, &data.items, votes, universe);
+            let region = render_memory_region(&scope, &heading, &ranked, &data.items, &data.ids, votes, universe);
             let out_path = output
                 .clone()
                 .or_else(|| input.clone())
@@ -1233,15 +1579,18 @@ fn main() {
             p["items"] = serde_json::json!(data.items.len());
             p["memories_hash"] = serde_json::json!(data.meta.memories_hash);
             p["constitution_hash"] = serde_json::json!(data.meta.constitution_hash);
-            p["pending_ids"] = serde_json::json!(
-                pending_list(&rt, &scope).into_iter().map(|(id, _)| id).collect::<Vec<_>>()
-            );
+            p["pending_ids"] = serde_json::json!(pending_list(&rt, &scope)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>());
             println!("{p}");
         }
         Cmd::Log { scope, last } => {
             let rt = open_rt(&cli.state);
-            let _ = load_scope(&rt, &scope);
-            let len = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
+            let data = load_scope(&rt, &scope);
+            let len = rt
+                .log_len()
+                .unwrap_or_else(|e| fail(format!("read log len: {e}")));
             let start = len.saturating_sub(last as u64 * 4 + 16);
             let recs = rt
                 .records_from(start)
@@ -1251,8 +1600,10 @@ fn main() {
                 if let Event::Vote {
                     scope: s,
                     cmp_id,
-                    a_item: _,
+                    a_item,
                     b_item: _,
+                    a_hash,
+                    b_hash,
                     a_share,
                     b_share,
                     winner,
@@ -1269,8 +1620,10 @@ fn main() {
                         "seq": r.seq,
                         "comparison_id": cmp_id,
                         "ratio": format!("{a_share}:{b_share}"),
-                        "winner": mem_id(winner),
-                        "loser": mem_id(loser),
+                        "winner": short_id(&tape_hash(&data.ids, winner, a_item, &a_hash, &b_hash)),
+                        "loser": short_id(&tape_hash(&data.ids, loser, a_item, &a_hash, &b_hash)),
+                        "winner_hash": tape_hash(&data.ids, winner, a_item, &a_hash, &b_hash),
+                        "loser_hash": tape_hash(&data.ids, loser, a_item, &a_hash, &b_hash),
                         "weight": weight,
                         "reason": reason,
                     }));
@@ -1290,17 +1643,23 @@ fn main() {
             let (a, b) = match found {
                 Some(ab) => ab,
                 None => {
-                    let len = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
+                    let len = rt
+                        .log_len()
+                        .unwrap_or_else(|e| fail(format!("read log len: {e}")));
                     let recs = rt
                         .records_from(0)
                         .unwrap_or_else(|e| fail(format!("read tape: {e}")));
                     let _ = len;
-                    recs
-                        .into_iter()
+                    recs.into_iter()
                         .filter_map(|r| match r.event {
-                            Event::Deal { scope: s, cmp_id: c, a, b } if s == scope && c == cmp_id => {
-                                Some((a, b))
-                            }
+                            Event::Deal {
+                                scope: s,
+                                cmp_id: c,
+                                a,
+                                b,
+                                a_hash: _,
+                                b_hash: _,
+                            } if s == scope && c == cmp_id => Some((a, b)),
                             _ => None,
                         })
                         .next()
@@ -1312,13 +1671,22 @@ fn main() {
                 serde_json::json!({
                     "comparison_id": cmp_id,
                     "scope": scope,
-                    "a": {"id": mem_id(a), "index": a, "text": data.items[a as usize]},
-                    "b": {"id": mem_id(b), "index": b, "text": data.items[b as usize]},
+                    "a": {"id": short_id(&data.ids[a as usize]), "hash": data.ids[a as usize], "index": a, "text": data.items[a as usize]},
+                    "b": {"id": short_id(&data.ids[b as usize]), "hash": data.ids[b as usize], "index": b, "text": data.items[b as usize]},
                     "constitution": data.constitution,
                 })
             );
         }
-        Cmd::VoteLoop { scope, model, base_url, key_var, env_file, votes: want, weight, timeout } => {
+        Cmd::VoteLoop {
+            scope,
+            model,
+            base_url,
+            key_var,
+            env_file,
+            votes: want,
+            weight,
+            timeout,
+        } => {
             if !weight.is_finite() || weight <= 0.0 {
                 fail("weight must be a positive number");
             }
@@ -1329,7 +1697,9 @@ fn main() {
                 let _ = dotenvy::dotenv();
             }
             let key = std::env::var(&key_var).unwrap_or_else(|_| {
-                fail(format!("{key_var} is not set (pass --env-file or export it)"))
+                fail(format!(
+                    "{key_var} is not set (pass --env-file or export it)"
+                ))
             });
             if key.trim().is_empty() {
                 fail(format!("{key_var} is empty"));
@@ -1351,74 +1721,148 @@ fn main() {
             let mut durs: Vec<f64> = Vec::new();
             // Chew: deal one, beg the judge, swallow her ratio onto the tape.
             while done < target {
-                let Some((a, b)) = deal_open_pair(&rt, &scope, n) else { break };
-                let seq = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
+                let Some((a, b)) = deal_open_pair(&rt, &scope, n) else {
+                    break;
+                };
+                let seq = rt
+                    .log_len()
+                    .unwrap_or_else(|e| fail(format!("read log len: {e}")));
                 let cmp_id = format!("cmp-{seq:04}");
-                rt.append(Event::Deal { scope: scope.clone(), cmp_id: cmp_id.clone(), a, b })
-                    .unwrap_or_else(|e| fail(format!("append deal: {e}")));
+                rt.append(Event::Deal {
+                    scope: scope.clone(),
+                    cmp_id: cmp_id.clone(),
+                    a,
+                    b,
+                    a_hash: data.ids[a as usize].clone(),
+                    b_hash: data.ids[b as usize].clone(),
+                })
+                .unwrap_or_else(|e| fail(format!("append deal: {e}")));
                 let vt0 = std::time::Instant::now();
                 let (ra, rb, reason) = match judge_pair(
-                    &client, &base_url, &key, &model,
-                    &data.constitution, &cmp_id,
-                    &data.items[a as usize], &data.items[b as usize],
+                    &client,
+                    &base_url,
+                    &key,
+                    &model,
+                    &data.constitution,
+                    &cmp_id,
+                    &data.items[a as usize],
+                    &data.items[b as usize],
                 ) {
                     Ok(j) => j,
                     Err(e) => fail(format!("{cmp_id} judge failed: {e}")),
                 };
                 let (wi, li) = if ra >= rb { (a, b) } else { (b, a) };
                 rt.append(Event::Vote {
-                    scope: scope.clone(), cmp_id: cmp_id.clone(),
-                    a_item: a, b_item: b, a_share: ra, b_share: rb,
-                    winner: wi, loser: li, weight,
-                    reason, constitution_hash: data.meta.constitution_hash.clone(),
+                    scope: scope.clone(),
+                    cmp_id: cmp_id.clone(),
+                    a_item: a,
+                    b_item: b,
+                    a_hash: data.ids[a as usize].clone(),
+                    b_hash: data.ids[b as usize].clone(),
+                    a_share: ra,
+                    b_share: rb,
+                    winner: wi,
+                    loser: li,
+                    weight,
+                    reason: reason.clone(),
+                    constitution_hash: data.meta.constitution_hash.clone(),
                 })
                 .unwrap_or_else(|e| fail(format!("append vote: {e}")));
                 let dt = vt0.elapsed().as_secs_f64();
                 durs.push(dt);
                 done += 1;
-                let sc = scores(&rt, &scope, n as usize);
-                let at = |i: u32| *sc.get(i as usize).unwrap_or(&0.0);
+                // Global floats lie on a disconnected graph — the honest scale
+                // is each item's own hunk, ranked on its induced subgraph.
+                let (_global, vote_groups) = grouped_ranking(&rt, &scope, n as usize);
+                let wctx = group_context(&vote_groups, &data.ids, wi);
+                let lctx = group_context(&vote_groups, &data.ids, li);
                 println!(
                     "{}",
                     serde_json::json!({
                         "ok": true,
                         "comparison_id": cmp_id,
                         "ratio": format!("{ra}:{rb}"),
-                        "winner": {"id": mem_id(wi), "text": data.items[wi as usize], "score": at(wi)},
-                        "loser": {"id": mem_id(li), "text": data.items[li as usize], "score": at(li)},
+                        "reason": reason,
+                        "winner": wctx,
+                        "loser": lctx,
                         "weight": weight,
                         "total_votes": vote_count(&rt, &scope),
                     })
                 );
-                // Tqdm-style drip on stderr: Master watches the hole fill.
-                let total_disp = if want == 0 { "until done".to_string() } else { want.to_string() };
+                // Tqdm-style drip on stderr: Master watches the hole fill, each
+                // block fenced and colored, reason snipped to 120 chars.
+                let total_disp = if want == 0 {
+                    "until done".to_string()
+                } else {
+                    want.to_string()
+                };
                 let avg = durs.iter().sum::<f64>() / durs.len().max(1) as f64;
                 let elapsed = t0.elapsed().as_secs_f64();
                 let prog = progress_json(&rt, &scope, n as usize);
-                let vuc = prog.get("votes_until_connected").and_then(|v| v.as_u64()).unwrap_or(0);
-                let eta_s = avg * (if want == 0 { vuc } else { target.saturating_sub(done) }) as f64;
+                let vuc = prog
+                    .get("votes_until_connected")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let eta_s = avg
+                    * (if want == 0 {
+                        vuc
+                    } else {
+                        target.saturating_sub(done)
+                    }) as f64;
                 let (em, es) = ((eta_s / 60.0) as u64, (eta_s % 60.0) as u64);
+                // Full bodies breathe on stderr above the one-line drip —
+                // training eyes only, never the tape (hashes only).
                 eprintln!(
-                    "[{}/{}] {} a:{} b:{} ratio {ra}:{rb} elapsed {:.0}s avg {:.1}s/vote ETA {:02}:{:02} votes_until_connected {vuc}",
-                    already + done, total_disp, cmp_id, mem_id(a), mem_id(b), elapsed, avg, em, es
+                    "{}",
+                    paint_body_block(
+                        &short_id(&data.ids[a as usize]),
+                        &data.items[a as usize],
+                        &short_id(&data.ids[b as usize]),
+                        &data.items[b as usize]
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    paint_progress_line(
+                        already + done,
+                        &total_disp,
+                        &cmp_id,
+                        &short_id(&data.ids[a as usize]),
+                        &short_id(&data.ids[b as usize]),
+                        ra,
+                        rb,
+                        &reason,
+                        elapsed,
+                        avg,
+                        em,
+                        es,
+                        vuc
+                    )
                 );
                 // Keep stderr wet and immediate: flush every line.
                 use std::io::Write as _;
                 let _ = std::io::stderr().flush();
             }
             let elapsed = t0.elapsed().as_secs_f64();
-            let avg = if durs.is_empty() { 0.0 } else { durs.iter().sum::<f64>() / durs.len() as f64 };
+            let avg = if durs.is_empty() {
+                0.0
+            } else {
+                durs.iter().sum::<f64>() / durs.len() as f64
+            };
             let prog = progress_json(&rt, &scope, n as usize);
-            let connected = prog.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
-            eprintln!(
-                "vote-loop done: {done} votes, elapsed {:.1}s, avg {:.1}s/vote, connected {connected}",
-                elapsed, avg
-            );
+            let connected = prog
+                .get("connected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!("{}", paint_done_line(done, elapsed, avg, connected));
         }
         Cmd::Verify => {
             let rt = open_rt(&cli.state);
             rt.verify().unwrap_or_else(|e| fail(format!("verify: {e}")));
-            println!("{}", serde_json::json!({"ok": true, "replay": "incremental == from zero"}));
+            println!(
+                "{}",
+                serde_json::json!({"ok": true, "replay": "incremental == from zero"})
+            );
         }
     }
 }
@@ -1435,7 +1879,12 @@ mod tests {
         assert_eq!(items.len(), 200);
         assert_eq!(items.len(), raw.len());
         // Raw slices: first 60 alnum chars identical to the source lines.
-        let alnum = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).take(60).collect::<String>();
+        let alnum = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_alphanumeric())
+                .take(60)
+                .collect::<String>()
+        };
         for (parsed, line) in items.iter().zip(raw.iter()) {
             assert_eq!(alnum(parsed), alnum(&line[2..]));
         }
@@ -1452,8 +1901,14 @@ mod tests {
         );
         let items = parse_memories_jsonl(src).expect("valid jsonl");
         assert_eq!(items.len(), 4);
-        assert_eq!(items[0], "[2026-09-17 18:34 PT] :) keep breathing.\n\nsecond para  ");
-        assert_eq!(items[1], "[2026-09-17 18:36 PT] - not a list item, just my words");
+        assert_eq!(
+            items[0],
+            "[2026-09-17 18:34 PT] :) keep breathing.\n\nsecond para  "
+        );
+        assert_eq!(
+            items[1],
+            "[2026-09-17 18:36 PT] - not a list item, just my words"
+        );
         assert_eq!(items[2], "no timestamp, still mine — curly ’ quotes");
         assert_eq!(items[3], "[2026-09-17 18:38 PT]    leading spaces kept");
     }
@@ -1464,6 +1919,42 @@ mod tests {
         assert!(err.contains("line 2"), "got: {err}");
         let err = parse_memories_jsonl("{\"ts_pt\": \"2026-01-01 00:00\"}\n").unwrap_err();
         assert!(err.contains("body"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_ids_are_stable_and_distinct() {
+        let a = turn_id("user", "2026-09-27T06:55:46.110Z", "talk to me");
+        assert_eq!(a, turn_id("user", "2026-09-27T06:55:46.110Z", "talk to me"));
+        assert_eq!(a.len(), 32);
+        // Same text, different timestamp: a different turn, a different id.
+        assert_ne!(a, turn_id("user", "2026-09-27T06:55:47.110Z", "talk to me"));
+        assert_ne!(
+            a,
+            turn_id("assistant", "2026-09-27T06:55:46.110Z", "talk to me")
+        );
+        assert_eq!(short_id(&a), format!("mem-{}", &a[..8]));
+    }
+
+    #[test]
+    fn short_id_never_panics_on_non_ascii() {
+        // Hex turn ids: unchanged behaviour.
+        assert_eq!(short_id("0123456789abcdef0123456789abcdef"), "mem-01234567");
+        // A legacy body-as-id with a multi-byte char straddling byte 8
+        // panicked the byte-slicing version; chars are the unit now.
+        assert_eq!(short_id("abcdefg→hij"), "mem-abcdefg→");
+        assert_eq!(short_id("short"), "mem-short");
+    }
+
+    #[test]
+    fn feed_ids_survive_reextract() {
+        let feed = concat!(
+            "{\"role\":\"user\",\"timestamp\":\"t1\",\"text\":\"hello\"}\n",
+            "{\"role\":\"assistant\",\"timestamp\":\"t2\",\"text\":\"hi\"}\n",
+        );
+        let once: Vec<String> = parse_feed(feed).into_iter().map(|(id, _)| id).collect();
+        let twice: Vec<String> = parse_feed(feed).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(once, twice);
+        assert_eq!(once.len(), 2);
     }
 
     #[test]
@@ -1481,7 +1972,11 @@ mod tests {
 
     fn sample_region(scope: &str, note: &str) -> String {
         let items = vec![format!("alpha {note}"), "beta".to_string()];
-        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, 7, 2)
+        let ids = vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, &ids, 7, 2)
     }
 
     fn fake_group(members: &[usize], ranked: &[(usize, f64)]) -> ranking::RankGroup {
@@ -1526,8 +2021,8 @@ mod tests {
         let r = sample_region("world", "x");
         assert!(r.starts_with("<!-- sorter:begin scope=world -->\n"));
         assert!(r.trim_end().ends_with("<!-- sorter:end -->"));
-        assert!(r.contains("- alpha x <!-- sorter:rank 1 score 0.6000 id mem-0000 -->"));
-        assert!(r.contains("- beta <!-- sorter:rank 2 score 0.4000 id mem-0001 -->"));
+        assert!(r.contains("- alpha x <!-- sorter:rank 1 score 0.6000 id mem-aaaaaaaa -->"));
+        assert!(r.contains("- beta <!-- sorter:rank 2 score 0.4000 id mem-bbbbbbbb -->"));
     }
 
     #[test]
