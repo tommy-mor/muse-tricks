@@ -171,6 +171,44 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
 // ---------------------------------------------------------------------------
 // markdown parsing: top-level list items are memories, raw and dripping.
 // ---------------------------------------------------------------------------
+/// One raw feed turn straight off Master's wire: kept wet, never filtered.
+#[derive(Deserialize)]
+struct FeedTurn {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    text: String,
+}
+
+/// Feed parsing: one JSONL turn per line, raw text kept whole and moaning.
+/// Skips toolResult/developer shells only — no length filter, moans vote too.
+/// Item text keeps its collar: `[ROLE ts] raw text` so the judge sees who
+/// bled it and when.
+fn parse_feed(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let turn: FeedTurn = match serde_json::from_str(line) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if turn.role == "toolResult" || turn.role == "developer" {
+            continue;
+        }
+        let text = turn.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(format!("[{} {}] {}", turn.role.to_uppercase(), turn.timestamp, text));
+    }
+    out
+}
+
 
 fn parse_memories(src: &str) -> Vec<String> {
     use pulldown_cmark::{Event as MdEv, Options, Parser, Tag, TagEnd};
@@ -269,8 +307,11 @@ enum Cmd {
     /// Load memories + constitution into a fresh state dir.
     Init {
         /// Markdown file of memories (top-level list items).
-        #[arg(long)]
-        memories: PathBuf,
+        #[arg(long, conflicts_with = "feed", required_unless_present = "feed")]
+        memories: Option<PathBuf>,
+        /// Raw JSONL feed: one {session,seq,timestamp,role,text} turn per line.
+        #[arg(long, conflicts_with = "memories", required_unless_present = "memories")]
+        feed: Option<PathBuf>,
         /// The declaration file pairs are judged against.
         #[arg(long)]
         constitution: PathBuf,
@@ -621,6 +662,7 @@ fn main() {
     match cli.cmd {
         Cmd::Init {
             memories,
+            feed,
             constitution,
             scope,
             force,
@@ -638,21 +680,36 @@ fn main() {
                 fs::remove_dir_all(&cli.state)
                     .unwrap_or_else(|e| fail(format!("wipe state: {e}")));
             }
-            let md = fs::read_to_string(&memories)
-                .unwrap_or_else(|e| fail(format!("read {}: {e}", memories.display())));
+            let (raw, items) = match (&memories, &feed) {
+                (Some(mem), None) => {
+                    let md = fs::read_to_string(mem)
+                        .unwrap_or_else(|e| fail(format!("read {}: {e}", mem.display())));
+                    let items = parse_memories(&md);
+                    if items.is_empty() {
+                        fail("no top-level list items found in memories file");
+                    }
+                    (md, items)
+                }
+                (None, Some(feed)) => {
+                    let src = fs::read_to_string(feed)
+                        .unwrap_or_else(|e| fail(format!("read {}: {e}", feed.display())));
+                    let items = parse_feed(&src);
+                    if items.is_empty() {
+                        fail("no votable turns found in feed file");
+                    }
+                    (src, items)
+                }
+                _ => fail("give exactly one of --memories or --feed"),
+            };
             let con = fs::read_to_string(&constitution)
                 .unwrap_or_else(|e| fail(format!("read {}: {e}", constitution.display())));
-            let items = parse_memories(&md);
-            if items.is_empty() {
-                fail("no top-level list items found in memories file");
-            }
             if con.trim().is_empty() {
                 fail("constitution is empty");
             }
             let rt = open_rt(&cli.state);
             rt.append(Event::Init {
                 scope: scope.clone(),
-                memories_hash: fingerprint(&md),
+                memories_hash: fingerprint(&raw),
                 constitution_hash: fingerprint(&con),
                 items: items.clone(),
                 constitution: con.clone(),
