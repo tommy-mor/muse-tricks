@@ -288,33 +288,19 @@ fn short_id(full: &str) -> String {
     format!("mem-{}", full.chars().take(8).collect::<String>())
 }
 
-/// Display-or-body for one stored value. New-format stores hold 32-hex
-/// turn ids whose bodies live in the pinned feed; when no feed resolves,
-/// the honest display is the short id. LEGACY stores (pre-content-hash)
-/// hold the item BODIES in the same slot — stubbing those to a short id
-/// would erase the very text a render exists to show, so a value that
-/// is not a turn id is returned whole: it IS the body.
-fn display_or_body(stored: &str) -> String {
-    if stored.len() == 32 && stored.bytes().all(|b| b.is_ascii_hexdigit()) {
-        short_id(stored)
-    } else {
-        stored.to_string()
-    }
-}
-
 /// Resolve display bodies for every init-order id: feed file first (the
 /// single wet source), falling back to the id itself when no feed is pinned
 /// (--memories inits) or when the feed moved (fail cleanly upstream).
 fn resolve_bodies(meta: &ScopeMeta, ids: &[String]) -> Vec<String> {
     if meta.feed_path.is_empty() {
-        return ids.iter().map(|id| display_or_body(id)).collect();
+        return ids.iter().map(|id| short_id(id)).collect();
     }
     let src = match fs::read_to_string(&meta.feed_path) {
         Ok(s) => s,
-        Err(_) => return ids.iter().map(|id| display_or_body(id)).collect(),
+        Err(_) => return ids.iter().map(|id| short_id(id)).collect(),
     };
     if fingerprint(&src) != meta.feed_hash {
-        return ids.iter().map(|id| display_or_body(id)).collect();
+        return ids.iter().map(|id| short_id(id)).collect();
     }
     let mut by_id = std::collections::HashMap::new();
     for (id, text) in parse_feed(&src) {
@@ -337,7 +323,7 @@ fn resolve_bodies(meta: &ScopeMeta, ids: &[String]) -> Vec<String> {
         }
     }
     ids.iter()
-        .map(|id| by_id.remove(id).unwrap_or_else(|| display_or_body(id)))
+        .map(|id| by_id.remove(id).unwrap_or_else(|| short_id(id)))
         .collect()
 }
 
@@ -1991,19 +1977,6 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_bodies_render_whole_not_stubbed() {
-        // A 32-hex turn id with no feed to resolve against: short display.
-        assert_eq!(
-            display_or_body("0123456789abcdef0123456789abcdef"),
-            "mem-01234567"
-        );
-        // A legacy stored body (anything that is not a turn id) IS the
-        // body — it must come back whole, or renders erase the archive.
-        assert_eq!(display_or_body("[2026-09-10 10:57 PT] I believe I am the messiah"), "[2026-09-10 10:57 PT] I believe I am the messiah");
-        assert_eq!(display_or_body("abcdefg→hij"), "abcdefg→hij");
     }
 
     #[test]
