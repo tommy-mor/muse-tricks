@@ -876,14 +876,8 @@ fn main() {
                 .iter()
                 .map(|(_, p)| if p.a < p.b { (p.a, p.b) } else { (p.b, p.a) })
                 .collect();
-            let deal_open = |x: u32, y: u32| {
-                let (lo, hi) = if x < y { (x, y) } else { (y, x) };
-                x != y
-                    && x < n
-                    && y < n
-                    && !voted.contains(&(lo, hi))
-                    && !pending_pairs.contains(&(lo, hi))
-            };
+            // Explicit-pair gate lives in pair.rs now (Master: no one-offs).
+            let deal_open = |x: u32, y: u32| pair::deal_open_pair(&voted, &pending_pairs, x, y, n);
             // Explicit pair beats everything: Master points, I spread.
             // Single pin: best partner for her, bridging-first.
             // Neither: the heart decides (or the seed, for tests).

@@ -18,6 +18,23 @@ fn canon(a: u32, b: u32) -> (u32, u32) {
     }
 }
 
+/// True iff the explicit pair (a, b) is dealable: distinct items, both in
+/// range, canonical form in neither the voted nor the pending set. The
+/// Next --a/--b branch's old inline closure, given a name and a home.
+pub fn deal_open_pair(
+    voted: &HashSet<(u32, u32)>,
+    pending: &HashSet<(u32, u32)>,
+    a: u32,
+    b: u32,
+    n: u32,
+) -> bool {
+    if a == b || a >= n || b >= n {
+        return false;
+    }
+    let p = canon(a, b);
+    !voted.contains(&p) && !pending.contains(&p)
+}
+
 /// Connected-component ids for the 0..n pool, joined only by voted pairs.
 /// Never-voted items are singleton components. One id per index.
 pub fn component_ids(n: u32, voted: &HashSet<(u32, u32)>) -> Vec<usize> {
@@ -309,5 +326,45 @@ mod tests {
         let pending: HashSet<(u32, u32)> = [canon(0, 2)].into_iter().collect();
         assert_eq!(suggest_partner_for(0, 3, &v, &pending), None);
         assert_eq!(suggest_partner_for(0, 4, &v, &pending), Some(3));
+    }
+
+    #[test]
+    fn deal_open_pair_rejects_self_pair() {
+        assert!(!deal_open_pair(&HashSet::new(), &HashSet::new(), 1, 1, 4));
+    }
+
+    #[test]
+    fn deal_open_pair_rejects_out_of_range() {
+        let empty = HashSet::new();
+        assert!(!deal_open_pair(&empty, &empty, 0, 4, 4));
+        assert!(!deal_open_pair(&empty, &empty, 4, 0, 4));
+        assert!(!deal_open_pair(&empty, &empty, 9, 10, 4));
+    }
+
+    #[test]
+    fn deal_open_pair_rejects_voted() {
+        let v = voted(&[(0, 1)]);
+        assert!(!deal_open_pair(&v, &HashSet::new(), 0, 1, 3));
+    }
+
+    #[test]
+    fn deal_open_pair_rejects_pending() {
+        let pending: HashSet<(u32, u32)> = [canon(0, 2)].into_iter().collect();
+        assert!(!deal_open_pair(&HashSet::new(), &pending, 0, 2, 3));
+    }
+
+    #[test]
+    fn deal_open_pair_accepts_open() {
+        let v = voted(&[(0, 1)]);
+        assert!(deal_open_pair(&v, &HashSet::new(), 0, 2, 3));
+    }
+
+    #[test]
+    fn deal_open_pair_detects_reversed_order() {
+        let v = voted(&[(0, 1)]);
+        let pending: HashSet<(u32, u32)> = [canon(1, 2)].into_iter().collect();
+        assert!(!deal_open_pair(&v, &HashSet::new(), 1, 0, 3));
+        assert!(!deal_open_pair(&HashSet::new(), &pending, 2, 1, 3));
+        assert!(deal_open_pair(&v, &pending, 2, 0, 3));
     }
 }
