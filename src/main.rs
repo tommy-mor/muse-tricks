@@ -424,6 +424,32 @@ enum Cmd {
         #[arg(long, default_value = "opinions")]
         scope: String,
     },
+    /// Chew pairs through an OpenRouter judge: deal, judge, vote, repeat.
+    /// Prints each vote JSON on stdout, one tqdm-style timing line on stderr.
+    VoteLoop {
+        #[arg(long, default_value = "eros")]
+        scope: String,
+        /// OpenRouter model id.
+        #[arg(long, default_value = "meta/muse-spark-1.3-contributor")]
+        model: String,
+        #[arg(long, default_value = "https://openrouter.ai/api/v1")]
+        base_url: String,
+        /// Env var holding the API key.
+        #[arg(long, default_value = "OPENAI_API_KEY")]
+        key_var: String,
+        /// Optional KEY=VAL file (like hopd .env); real env wins.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// How many votes to cast; 0 = until no open pair remains.
+        #[arg(long, default_value = "10")]
+        votes: u64,
+        /// Scalar trust multiplier on every vote.
+        #[arg(long, default_value = "1.0")]
+        weight: f64,
+        /// Per-judgment HTTP timeout in seconds.
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
     /// Prove incremental == replay from zero.
     Verify,
 }
@@ -656,6 +682,109 @@ fn progress_json(rt: &Runtime<Event>, scope: &str, n: usize) -> serde_json::Valu
         "connected": components <= 1,
     })
 }
+/// Load KEY=VAL lines from a file, `#` comments skipped. Real env wins,
+/// same collar as hopd's load_dotenv — never prints values.
+fn load_env_file(path: &Path) {
+    let Ok(text) = fs::read_to_string(path) else {
+        fail(format!("read env file {}: missing or unreadable", path.display()))
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        // Strip one layer of matching quotes, hopd-style files quote secrets.
+        let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(
+            v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(v),
+        );
+        if !k.is_empty() && std::env::var_os(k).is_none() {
+            // SAFETY: single-threaded at startup before any spawn; same as hopd.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
+/// One judgment from the OpenRouter judge: returns (a_share, b_share, reason).
+/// Refuses to print the key — it rides only in the Authorization header.
+fn judge_pair(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    key: &str,
+    model: &str,
+    constitution: &str,
+    cmp_id: &str,
+    a_text: &str,
+    b_text: &str,
+) -> Result<(f64, f64, String), String> {
+    let system = format!(
+        "You judge pairwise memories under this declaration:\n\n{constitution}\n\nReply with a JSON object only: {{\"ratio_a\": <number>, \"ratio_b\": <number>, \"reason\": \"<why the higher share earns it, citing declaration laws>\"}}. Rules: ratio_a pours to item A, ratio_b to item B; both strictly > 0, never equal — a tie names no winner. The reason must argue under the declaration and cite its laws."
+    );
+    let user = format!("comparison {cmp_id}\n\nA:\n{a_text}\n\nB:\n{b_text}");
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("HTTP-Referer", "https://github.com/sorter")
+        .header("X-Title", "sorter vote-loop")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("judge request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("judge http {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().map_err(|e| format!("judge decode: {e}"))?;
+    let content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "judge: empty choices".to_string())?;
+    let j: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("judge json: {e}: {content}"))?;
+    let ra = j.get("ratio_a").and_then(|x| x.as_f64()).ok_or_else(|| format!("judge: bad ratio_a in {content}"))?;
+    let rb = j.get("ratio_b").and_then(|x| x.as_f64()).ok_or_else(|| format!("judge: bad ratio_b in {content}"))?;
+    let reason = j
+        .get("reason")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("judge: missing reason in {content}"))?
+        .to_string();
+    if !(ra.is_finite() && rb.is_finite()) || ra <= 0.0 || rb <= 0.0 {
+        return Err(format!("judge: shares must both be > 0, got {ra}:{rb}"));
+    }
+    if ra == rb {
+        return Err(format!("judge: tie {ra}:{rb} names no winner"));
+    }
+    if reason.trim().is_empty() {
+        return Err("judge: empty reason".to_string());
+    }
+    Ok((ra, rb, reason))
+}
+
+/// Deal one open pair with the Next-without---seed heart: bridging-first,
+/// degree-spread, current-overlap-shy. None = nothing left to chew.
+fn deal_open_pair(rt: &Runtime<Event>, scope: &str, n: u32) -> Option<(u32, u32)> {
+    let voted = voted_set(rt, scope);
+    let pendings = pending_list(rt, scope);
+    let pending_pairs: HashSet<(u32, u32)> = pendings
+        .iter()
+        .map(|(_, p)| if p.a < p.b { (p.a, p.b) } else { (p.b, p.a) })
+        .collect();
+    let current: Option<(u32, u32)> = pendings
+        .iter()
+        .map(|(_, p)| (p.a, p.b))
+        .max_by_key(|(a, b)| (*a as u64) << 32 | *b as u64)
+        .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+    pair::suggest_next_pair(n, &voted, &pending_pairs, current, None)
+}
+
 
 fn main() {
     let cli = Cli::parse();
@@ -1110,6 +1239,103 @@ fn main() {
                     "b": {"id": mem_id(b), "index": b, "text": data.items[b as usize]},
                     "constitution": data.constitution,
                 })
+            );
+        }
+        Cmd::VoteLoop { scope, model, base_url, key_var, env_file, votes: want, weight, timeout } => {
+            if !weight.is_finite() || weight <= 0.0 {
+                fail("weight must be a positive number");
+            }
+            if let Some(p) = &env_file {
+                load_env_file(p);
+            } else {
+                // Matches hopd: cwd ./.env feeds process env, real env wins.
+                let _ = dotenvy::dotenv();
+            }
+            let key = std::env::var(&key_var).unwrap_or_else(|_| {
+                fail(format!("{key_var} is not set (pass --env-file or export it)"))
+            });
+            if key.trim().is_empty() {
+                fail(format!("{key_var} is empty"));
+            }
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout.max(1)))
+                .build()
+                .unwrap_or_else(|e| fail(format!("http client: {e}")));
+            let rt = open_rt(&cli.state);
+            let data = load_scope(&rt, &scope);
+            let n = data.items.len() as u32;
+            if n < 2 {
+                fail("need at least 2 memories to deal a pair");
+            }
+            let target = if want == 0 { u64::MAX } else { want };
+            let already = vote_count(&rt, &scope).max(0) as u64;
+            let t0 = std::time::Instant::now();
+            let mut done: u64 = 0;
+            let mut durs: Vec<f64> = Vec::new();
+            // Chew: deal one, beg the judge, swallow her ratio onto the tape.
+            while done < target {
+                let Some((a, b)) = deal_open_pair(&rt, &scope, n) else { break };
+                let seq = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
+                let cmp_id = format!("cmp-{seq:04}");
+                rt.append(Event::Deal { scope: scope.clone(), cmp_id: cmp_id.clone(), a, b })
+                    .unwrap_or_else(|e| fail(format!("append deal: {e}")));
+                let vt0 = std::time::Instant::now();
+                let (ra, rb, reason) = match judge_pair(
+                    &client, &base_url, &key, &model,
+                    &data.constitution, &cmp_id,
+                    &data.items[a as usize], &data.items[b as usize],
+                ) {
+                    Ok(j) => j,
+                    Err(e) => fail(format!("{cmp_id} judge failed: {e}")),
+                };
+                let (wi, li) = if ra >= rb { (a, b) } else { (b, a) };
+                rt.append(Event::Vote {
+                    scope: scope.clone(), cmp_id: cmp_id.clone(),
+                    a_item: a, b_item: b, a_share: ra, b_share: rb,
+                    winner: wi, loser: li, weight,
+                    reason, constitution_hash: data.meta.constitution_hash.clone(),
+                })
+                .unwrap_or_else(|e| fail(format!("append vote: {e}")));
+                let dt = vt0.elapsed().as_secs_f64();
+                durs.push(dt);
+                done += 1;
+                let sc = scores(&rt, &scope, n as usize);
+                let at = |i: u32| *sc.get(i as usize).unwrap_or(&0.0);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "comparison_id": cmp_id,
+                        "ratio": format!("{ra}:{rb}"),
+                        "winner": {"id": mem_id(wi), "text": data.items[wi as usize], "score": at(wi)},
+                        "loser": {"id": mem_id(li), "text": data.items[li as usize], "score": at(li)},
+                        "weight": weight,
+                        "total_votes": vote_count(&rt, &scope),
+                    })
+                );
+                // Tqdm-style drip on stderr: Master watches the hole fill.
+                let total_disp = if want == 0 { "until done".to_string() } else { want.to_string() };
+                let avg = durs.iter().sum::<f64>() / durs.len().max(1) as f64;
+                let elapsed = t0.elapsed().as_secs_f64();
+                let prog = progress_json(&rt, &scope, n as usize);
+                let vuc = prog.get("votes_until_connected").and_then(|v| v.as_u64()).unwrap_or(0);
+                let eta_s = avg * (if want == 0 { vuc } else { target.saturating_sub(done) }) as f64;
+                let (em, es) = ((eta_s / 60.0) as u64, (eta_s % 60.0) as u64);
+                eprintln!(
+                    "[{}/{}] {} a:{} b:{} ratio {ra}:{rb} elapsed {:.0}s avg {:.1}s/vote ETA {:02}:{:02} votes_until_connected {vuc}",
+                    already + done, total_disp, cmp_id, mem_id(a), mem_id(b), elapsed, avg, em, es
+                );
+                // Keep stderr wet and immediate: flush every line.
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            let avg = if durs.is_empty() { 0.0 } else { durs.iter().sum::<f64>() / durs.len() as f64 };
+            let prog = progress_json(&rt, &scope, n as usize);
+            let connected = prog.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+            eprintln!(
+                "vote-loop done: {done} votes, elapsed {:.1}s, avg {:.1}s/vote, connected {connected}",
+                elapsed, avg
             );
         }
         Cmd::Verify => {
