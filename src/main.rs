@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use durable::{Durable, Leaf, Map, Runtime, Sum, Tx};
+use owo_colors::OwoColorize;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
@@ -889,6 +890,114 @@ fn load_env_file(path: &Path) {
     }
 }
 
+/// One fancy tqdm drip on stderr: each block its own color, `|` fences between.
+/// Blocks: progress, cmp + pair, ratio, reason (truncated, quoted), timing,
+/// votes_until_connected. Colors die under `NO_COLOR` or a piped stderr, so
+/// logs stay clean — owo-colors handles both by itself.
+#[allow(clippy::too_many_arguments)] // One tqdm drip takes a full hand of blocks; a struct would only scatter the wet.
+fn paint_progress_line(
+    done_disp: u64,
+    total_disp: &str,
+    cmp_id: &str,
+    a: &str,
+    b: &str,
+    ra: f64,
+    rb: f64,
+    reason: &str,
+    elapsed: f64,
+    avg: f64,
+    em: u64,
+    es: u64,
+    vuc: u64,
+) -> String {
+    // Flatten the judge's newlines so the drip stays one line, then snip her.
+    let flat: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snip: String = flat.chars().take(120).collect();
+    if flat.chars().count() > 120 {
+        snip.push('…');
+    }
+    let fence = "|".bright_black().to_string();
+    [
+        format!("{}", format!("[{done_disp}/{total_disp}]").cyan().bold()),
+        format!(
+            "{} {} {}",
+            cmp_id.magenta().bold(),
+            format!("a:{a}").yellow(),
+            format!("b:{b}").yellow()
+        ),
+        format!("{}", format!("ratio {ra}:{rb}").green().bold()),
+        format!("{}", format!("reason \"{snip}\"").blue()),
+        format!(
+            "{}",
+            format!("elapsed {elapsed:.0}s avg {avg:.1}s/vote ETA {em:02}:{es:02}").bright_black()
+        ),
+        format!("{}", format!("votes_until_connected {vuc}").red().bold()),
+    ]
+    .join(&format!(" {fence} "))
+}
+
+/// The spent-and-done line when the loop breaks: same fences, same throat.
+fn paint_done_line(done: u64, elapsed: f64, avg: f64, connected: bool) -> String {
+    let fence = "|".bright_black().to_string();
+    [
+        format!("{}", "vote-loop done".cyan().bold()),
+        format!("{}", format!("{done} votes").magenta().bold()),
+        format!(
+            "{}",
+            format!("elapsed {elapsed:.1}s avg {avg:.1}s/vote").bright_black()
+        ),
+        format!("{}", format!("connected {connected}").red().bold()),
+    ]
+    .join(&format!(" {fence} "))
+}
+
+/// The full wet bodies of A and B, stderr only for training eyes — the tape
+/// stays bodiless (hashes only), this block never touches stdout or the log.
+/// Breathing room around every fold: blank, label, body, blank, label, body.
+fn paint_body_block(a_id: &str, a_body: &str, b_id: &str, b_body: &str) -> String {
+    format!(
+        "\n{}\n{}\n\n{}\n{}\n",
+        format!("A ({a_id}):").yellow().bold(),
+        a_body,
+        format!("B ({b_id}):").yellow().bold(),
+        b_body
+    )
+}
+
+/// Honest per-vote context: where this item sits inside its own connected
+/// hunk. Singletons ride alone — group_size 1, group_rank 1.
+fn group_context(
+    groups: &[ranking::RankGroup],
+    ids: &[String],
+    idx: u32,
+) -> serde_json::Value {
+    for (gi, g) in groups.iter().enumerate() {
+        if let Some((pos, _)) = g
+            .ranked
+            .iter()
+            .enumerate()
+            .find(|&(_, &(m, _))| m == idx as usize)
+        {
+            let m = idx as usize;
+            return serde_json::json!({
+                "id": short_id(&ids[m]),
+                "hash": ids[m],
+                "group": gi,
+                "group_rank": pos + 1,
+                "group_size": g.members.len(),
+            });
+        }
+    }
+    let m = idx as usize;
+    serde_json::json!({
+        "id": short_id(&ids[m]),
+        "hash": ids[m],
+        "group": groups.len(),
+        "group_rank": 1,
+        "group_size": 1,
+    })
+}
+
 /// One judgment from the OpenRouter judge: returns (a_share, b_share, reason).
 /// Refuses to print the key — it rides only in the Authorization header.
 #[allow(clippy::too_many_arguments)] // One judge call takes a full hand of params; splitting her would only scatter the mess.
@@ -1295,8 +1404,22 @@ fn main() {
                 constitution_hash: constitution_hash.clone(),
             })
             .unwrap_or_else(|e| fail(format!("append vote: {e}")));
-            let sc = scores(&rt, &scope, data.items.len());
-            let at = |i: u32| *sc.get(i as usize).unwrap_or(&0.0);
+            // Global floats lie on a disconnected graph — the honest scale is
+            // each item's own hunk, ranked on its induced subgraph.
+            let (_global, vote_groups) = grouped_ranking(&rt, &scope, data.items.len());
+            let wctx = group_context(&vote_groups, &data.ids, wi);
+            let lctx = group_context(&vote_groups, &data.ids, li);
+            // Training eyes only: full bodies breathe on stderr, never on the
+            // tape (hashes only) or stdout (group context only).
+            eprintln!(
+                "{}",
+                paint_body_block(
+                    &short_id(&data.ids[p.a as usize]),
+                    &data.items[p.a as usize],
+                    &short_id(&data.ids[p.b as usize]),
+                    &data.items[p.b as usize]
+                )
+            );
             println!(
                 "{}",
                 serde_json::json!({
@@ -1304,8 +1427,8 @@ fn main() {
                     "comparison_id": cmp_id,
                     "ratio": format!("{a_share}:{b_share}"),
                     "reason": reason,
-                    "winner": {"id": short_id(&data.ids[wi as usize]), "hash": data.ids[wi as usize], "text": data.items[wi as usize], "score": at(wi)},
-                    "loser": {"id": short_id(&data.ids[li as usize]), "hash": data.ids[li as usize], "text": data.items[li as usize], "score": at(li)},
+                    "winner": wctx,
+                    "loser": lctx,
                     "weight": weight,
                     "total_votes": vote_count(&rt, &scope),
                 })
@@ -1622,8 +1745,11 @@ fn main() {
                 let dt = vt0.elapsed().as_secs_f64();
                 durs.push(dt);
                 done += 1;
-                let sc = scores(&rt, &scope, n as usize);
-                let at = |i: u32| *sc.get(i as usize).unwrap_or(&0.0);
+                // Global floats lie on a disconnected graph — the honest scale
+                // is each item's own hunk, ranked on its induced subgraph.
+                let (_global, vote_groups) = grouped_ranking(&rt, &scope, n as usize);
+                let wctx = group_context(&vote_groups, &data.ids, wi);
+                let lctx = group_context(&vote_groups, &data.ids, li);
                 println!(
                     "{}",
                     serde_json::json!({
@@ -1631,13 +1757,14 @@ fn main() {
                         "comparison_id": cmp_id,
                         "ratio": format!("{ra}:{rb}"),
                         "reason": reason,
-                        "winner": {"id": short_id(&data.ids[wi as usize]), "hash": data.ids[wi as usize], "text": data.items[wi as usize], "score": at(wi)},
-                        "loser": {"id": short_id(&data.ids[li as usize]), "hash": data.ids[li as usize], "text": data.items[li as usize], "score": at(li)},
+                        "winner": wctx,
+                        "loser": lctx,
                         "weight": weight,
                         "total_votes": vote_count(&rt, &scope),
                     })
                 );
-                // Tqdm-style drip on stderr: Master watches the hole fill.
+                // Tqdm-style drip on stderr: Master watches the hole fill, each
+                // block fenced and colored, reason snipped to 120 chars.
                 let total_disp = if want == 0 {
                     "until done".to_string()
                 } else {
@@ -1657,9 +1784,34 @@ fn main() {
                         target.saturating_sub(done)
                     }) as f64;
                 let (em, es) = ((eta_s / 60.0) as u64, (eta_s % 60.0) as u64);
+                // Full bodies breathe on stderr above the one-line drip —
+                // training eyes only, never the tape (hashes only).
                 eprintln!(
-                    "[{}/{}] {} a:{} b:{} ratio {ra}:{rb} reason {:.120} elapsed {:.0}s avg {:.1}s/vote ETA {:02}:{:02} votes_until_connected {vuc}",
-                    already + done, total_disp, cmp_id, short_id(&data.ids[a as usize]), short_id(&data.ids[b as usize]), reason, elapsed, avg, em, es
+                    "{}",
+                    paint_body_block(
+                        &short_id(&data.ids[a as usize]),
+                        &data.items[a as usize],
+                        &short_id(&data.ids[b as usize]),
+                        &data.items[b as usize]
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    paint_progress_line(
+                        already + done,
+                        &total_disp,
+                        &cmp_id,
+                        &short_id(&data.ids[a as usize]),
+                        &short_id(&data.ids[b as usize]),
+                        ra,
+                        rb,
+                        &reason,
+                        elapsed,
+                        avg,
+                        em,
+                        es,
+                        vuc
+                    )
                 );
                 // Keep stderr wet and immediate: flush every line.
                 use std::io::Write as _;
@@ -1676,10 +1828,7 @@ fn main() {
                 .get("connected")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            eprintln!(
-                "vote-loop done: {done} votes, elapsed {:.1}s, avg {:.1}s/vote, connected {connected}",
-                elapsed, avg
-            );
+            eprintln!("{}", paint_done_line(done, elapsed, avg, connected));
         }
         Cmd::Verify => {
             let rt = open_rt(&cli.state);
