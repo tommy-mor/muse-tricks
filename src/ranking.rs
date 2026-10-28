@@ -174,9 +174,9 @@ pub fn rank_groups(
         .map(|mem| {
             let map: HashMap<usize, usize> =
                 mem.iter().enumerate().map(|(li, &gi)| (gi, li)).collect();
-            let local_edges = edges.iter().filter_map(|&(s, d, w)| {
-                Some(((*map.get(&s)?, *map.get(&d)?), w))
-            });
+            let local_edges = edges
+                .iter()
+                .filter_map(|&(s, d, w)| Some(((*map.get(&s)?, *map.get(&d)?), w)));
             let local = compute_scores_from_edges(mem.len(), local_edges, max_iters, tol);
             let mut ranked: Vec<(usize, f64)> = mem
                 .iter()
@@ -190,9 +190,7 @@ pub fn rank_groups(
             });
             let pairs = voted
                 .iter()
-                .filter(|&&(a, b)| {
-                    a < n && b < n && map.contains_key(&a) && map.contains_key(&b)
-                })
+                .filter(|&&(a, b)| a < n && b < n && map.contains_key(&a) && map.contains_key(&b))
                 .count();
             RankGroup {
                 members: mem,

@@ -6,8 +6,8 @@
 //! disconnected, overlap deprioritization so the agent isn't re-dealt the
 //! pair it just saw. Same keys, same order, same tests — smaller mouth.
 
-use std::collections::{HashMap, HashSet};
 use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 /// Canonical unordered pair: (lo, hi). Voted/pending sets hold these.
 fn canon(a: u32, b: u32) -> (u32, u32) {
@@ -66,10 +66,10 @@ pub fn component_ids(n: u32, voted: &HashSet<(u32, u32)>) -> Vec<usize> {
     }
     let mut root_to_id: HashMap<usize, usize> = HashMap::new();
     let mut out = vec![0usize; n];
-    for i in 0..n {
+    for (i, slot) in out.iter_mut().enumerate().take(n) {
         let r = find(&mut parent, i);
         let next = root_to_id.len();
-        out[i] = *root_to_id.entry(r).or_insert(next);
+        *slot = *root_to_id.entry(r).or_insert(next);
     }
     out
 }
@@ -147,7 +147,7 @@ pub fn suggest_next_pair(
                     a,
                     b,
                 );
-                if best.as_ref().map_or(true, |best| key < *best) {
+                if best.as_ref().is_none_or(|best| key < *best) {
                     best = Some(key);
                 }
             }
@@ -174,7 +174,7 @@ pub fn suggest_next_pair(
                 a,
                 b,
             );
-            if best.as_ref().map_or(true, |best| key < *best) {
+            if best.as_ref().is_none_or(|best| key < *best) {
                 best = Some(key);
             }
         }
@@ -225,7 +225,7 @@ pub fn suggest_partner_for(
             degree[b as usize],
             b,
         );
-        if best.as_ref().map_or(true, |best| key < *best) {
+        if best.as_ref().is_none_or(|best| key < *best) {
             best = Some(key);
         }
     }
@@ -295,7 +295,8 @@ mod tests {
     #[test]
     fn excluded_pairs_stay_out() {
         let excluded: HashSet<(u32, u32)> = [canon(0, 1)].into_iter().collect();
-        let next = suggest_next_pair(3, &HashSet::new(), &HashSet::new(), None, Some(&excluded)).unwrap();
+        let next =
+            suggest_next_pair(3, &HashSet::new(), &HashSet::new(), None, Some(&excluded)).unwrap();
         assert_ne!(canon(next.0, next.1), (0, 1));
         assert!(next.0 == 2 || next.1 == 2);
     }
@@ -309,7 +310,8 @@ mod tests {
     #[test]
     fn overlap_avoids_current_items() {
         // Nothing voted: with current (0,1), the clean pair avoids both.
-        let next = suggest_next_pair(4, &HashSet::new(), &HashSet::new(), Some((0, 1)), None).unwrap();
+        let next =
+            suggest_next_pair(4, &HashSet::new(), &HashSet::new(), Some((0, 1)), None).unwrap();
         assert_eq!(canon(next.0, next.1), (2, 3));
     }
 
