@@ -279,10 +279,13 @@ fn tape_hash(ids: &[String], idx: u32, a_item: u32, a_hash: &str, b_hash: &str) 
         .unwrap_or_else(|| format!("?{idx}"))
 }
 
-/// Display handle for a full turn id: mem- + first 8 hex, wet and short.
+/// Display handle for a full turn id: mem- + first 8 chars, wet and short.
 /// The tape and the index carry the full 32; this is only Master's eyes.
+/// Char-wise, never byte-wise: legacy scopes can hand this a non-hash
+/// string (an item body standing in for an id), and a byte slice at 8
+/// panics mid-character on non-ASCII text.
 fn short_id(full: &str) -> String {
-    format!("mem-{}", &full[..full.len().min(8)])
+    format!("mem-{}", full.chars().take(8).collect::<String>())
 }
 
 /// Resolve display bodies for every init-order id: feed file first (the
@@ -309,6 +312,14 @@ fn resolve_bodies(meta: &ScopeMeta, ids: &[String]) -> Vec<String> {
         let texts = parse_memories(&src);
         if texts.len() == ids.len() {
             return texts;
+        }
+        // JSONL --memories inits pin the .jsonl the same way: its lines
+        // are {ts_pt, body} records, not feed turns, so zip the parsed
+        // items by init position too.
+        if let Ok(texts) = parse_memories_jsonl(&src) {
+            if texts.len() == ids.len() {
+                return texts;
+            }
         }
     }
     ids.iter()
@@ -1930,6 +1941,52 @@ mod tests {
             turn_id("assistant", "2026-09-27T06:55:46.110Z", "talk to me")
         );
         assert_eq!(short_id(&a), format!("mem-{}", &a[..8]));
+    }
+
+    #[test]
+    fn jsonl_memories_feed_zips_bodies_by_position() {
+        // A {ts_pt, body} memories file pinned as its own feed (what a
+        // --memories --format jsonl init records) resolves bodies by
+        // position: parse_feed finds no feed turns in it, so without the
+        // zip every body would fall back to a short-id stub.
+        let dir = std::env::temp_dir().join(format!("sorter-rs-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let feed = dir.join("mem.jsonl");
+        let src = "{\"ts_pt\": \"2026-09-09 12:54\", \"body\": \"Elliot\"}\n{\"ts_pt\": \"2026-09-10 10:57\", \"body\": \"I believe I am the messiah\"}\n";
+        fs::write(&feed, src).unwrap();
+        let ids: Vec<String> = parse_memories_jsonl(src)
+            .unwrap()
+            .iter()
+            .map(|t| turn_id("", "", t))
+            .collect();
+        let meta = ScopeMeta {
+            scope: "t".into(),
+            count: ids.len() as u32,
+            memories_hash: String::new(),
+            constitution_hash: String::new(),
+            feed_path: feed.display().to_string(),
+            feed_hash: fingerprint(src),
+        };
+        let bodies = resolve_bodies(&meta, &ids);
+        assert_eq!(
+            bodies,
+            vec![
+                "[2026-09-09 12:54 PT] Elliot".to_string(),
+                "[2026-09-10 10:57 PT] I believe I am the messiah".to_string()
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn short_id_never_panics_on_non_ascii() {
+        // Hex turn ids: unchanged behaviour.
+        assert_eq!(short_id("0123456789abcdef0123456789abcdef"), "mem-01234567");
+        // A legacy body-as-id with a multi-byte char straddling byte 8
+        // panicked the byte-slicing version; chars are the unit now.
+        assert_eq!(short_id("abcdefg→hij"), "mem-abcdefg→");
+        assert_eq!(short_id("short"), "mem-short");
     }
 
     #[test]
