@@ -26,12 +26,12 @@ mod pair;
 // durable schema: the index. votes.jsonl is truth, this is all rebuildable.
 // ---------------------------------------------------------------------------
 
-/// One memory's kamarbandh-less body: raw markdown, exactly as parsed.
+/// One memory's kamarbandh-less collar tag: position (init order) -> stable
+/// content-hash turn id. Bodies live once in the feed file; never here.
 #[derive(Durable)]
-#[allow(dead_code)]
 struct Scope {
-    /// idx -> raw markdown text of the memory.
-    items: Map<u32, Leaf<String>>,
+    /// init-order position -> full hex turn id (md5 of role/timestamp/text).
+    item_ids: Map<u32, Leaf<String>>,
     /// The constitution snapshot this scope judges under.
     constitution: Leaf<String>,
     /// What was loaded, and under which hashes.
@@ -58,6 +58,12 @@ struct ScopeMeta {
     count: u32,
     memories_hash: String,
     constitution_hash: String,
+    /// Feed file bodies resolve from (empty for --memories inits).
+    #[serde(default)]
+    feed_path: String,
+    /// Fingerprint of the raw feed bytes at init; mismatch = stale feed.
+    #[serde(default)]
+    feed_hash: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -75,16 +81,24 @@ struct Pending {
 enum Event {
     Init {
         scope: String,
-        items: Vec<String>,
+        item_ids: Vec<String>,
         constitution: String,
         memories_hash: String,
         constitution_hash: String,
+        #[serde(default)]
+        feed_path: String,
+        #[serde(default)]
+        feed_hash: String,
     },
     Deal {
         scope: String,
         cmp_id: String,
         a: u32,
         b: u32,
+        #[serde(default)]
+        a_hash: String,
+        #[serde(default)]
+        b_hash: String,
     },
     Vote {
         scope: String,
@@ -93,6 +107,11 @@ enum Event {
         /// are derived conveniences; the EDGES key off these two.
         a_item: u32,
         b_item: u32,
+        /// Full content-hash ids, stable across re-extracts.
+        #[serde(default)]
+        a_hash: String,
+        #[serde(default)]
+        b_hash: String,
         /// Ratio the agent dealt to a (x in "x:y"), strictly positive.
         a_share: f64,
         /// Ratio the agent dealt to b (y in "x:y"), strictly positive.
@@ -113,24 +132,28 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
     match event {
         Event::Init {
             scope,
-            items,
+            item_ids,
             constitution,
             memories_hash,
             constitution_hash,
+            feed_path,
+            feed_hash,
         } => {
             let s = Store::root().scopes().key(scope);
-            for (i, text) in items.iter().enumerate() {
-                tx.write(s.items().key(&(i as u32)).set(text));
+            for (i, id) in item_ids.iter().enumerate() {
+                tx.write(s.item_ids().key(&(i as u32)).set(id));
             }
             tx.write(s.constitution().set(constitution));
             tx.write(s.meta().set(&ScopeMeta {
                 scope: scope.clone(),
-                count: items.len() as u32,
+                count: item_ids.len() as u32,
                 memories_hash: memories_hash.clone(),
                 constitution_hash: constitution_hash.clone(),
+                feed_path: feed_path.clone(),
+                feed_hash: feed_hash.clone(),
             }));
         }
-        Event::Deal { scope, cmp_id, a, b } => {
+        Event::Deal { scope, cmp_id, a, b, a_hash: _, b_hash: _ } => {
             let s = Store::root().scopes().key(scope);
             tx.write(s.pending().key(cmp_id).set(&Pending { a: *a, b: *b }));
         }
@@ -139,6 +162,8 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
             cmp_id,
             a_item,
             b_item,
+            a_hash: _,
+            b_hash: _,
             a_share,
             b_share,
             winner: _,
@@ -185,8 +210,10 @@ struct FeedTurn {
 /// Feed parsing: one JSONL turn per line, raw text kept whole and moaning.
 /// Skips toolResult/developer shells only — no length filter, moans vote too.
 /// Item text keeps its collar: `[ROLE ts] raw text` so the judge sees who
-/// bled it and when.
-fn parse_feed(src: &str) -> Vec<String> {
+/// bled it and when. Returns (id, text) pairs: id is hex(md5) of the
+/// canonical bytes `role + "\n" + timestamp + "\n" + text` — same input
+/// bytes, same id, every rerun; distinct turns never collide.
+fn parse_feed(src: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in src.lines() {
         let line = line.trim();
@@ -204,9 +231,72 @@ fn parse_feed(src: &str) -> Vec<String> {
         if text.is_empty() {
             continue;
         }
-        out.push(format!("[{} {}] {}", turn.role.to_uppercase(), turn.timestamp, text));
+        let id = turn_id(&turn.role, &turn.timestamp, text);
+        out.push((id, format!("[{} {}] {}", turn.role.to_uppercase(), turn.timestamp, text)));
     }
     out
+}
+
+/// Stable turn id: hex(md5) of canonical `role + "\n" + timestamp + "\n" + text`.
+/// Same turn bytes -> same id across reruns and machines; even identical
+/// text at different timestamps bleeds a different id.
+fn turn_id(role: &str, timestamp: &str, text: &str) -> String {
+    let mut ctx = md5::Context::new();
+    ctx.consume(role.as_bytes());
+    ctx.consume(b"\n");
+    ctx.consume(timestamp.as_bytes());
+    ctx.consume(b"\n");
+    ctx.consume(text.trim().as_bytes());
+    format!("{:x}", ctx.finalize())
+}
+
+/// Positional index -> tape hash: the Vote event's own a_hash/b_hash win
+/// (dealer-order: a_hash belongs to a_item); the init-order id map covers
+/// pre-hash tapes that carry "".
+fn tape_hash(ids: &[String], idx: u32, a_item: u32, a_hash: &str, b_hash: &str) -> String {
+    if !a_hash.is_empty() || !b_hash.is_empty() {
+        return if idx == a_item {
+            a_hash.to_string()
+        } else {
+            b_hash.to_string()
+        };
+    }
+    ids.get(idx as usize).cloned().unwrap_or_else(|| format!("?{idx}"))
+}
+
+/// Display handle for a full turn id: mem- + first 8 hex, wet and short.
+/// The tape and the index carry the full 32; this is only Master's eyes.
+fn short_id(full: &str) -> String {
+    format!("mem-{}", &full[..full.len().min(8)])
+}
+
+/// Resolve display bodies for every init-order id: feed file first (the
+/// single wet source), falling back to the id itself when no feed is pinned
+/// (--memories inits) or when the feed moved (fail cleanly upstream).
+fn resolve_bodies(meta: &ScopeMeta, ids: &[String]) -> Vec<String> {
+    if meta.feed_path.is_empty() {
+        return ids.iter().map(|id| short_id(id)).collect();
+    }
+    let src = match fs::read_to_string(&meta.feed_path) {
+        Ok(s) => s,
+        Err(_) => return ids.iter().map(|id| short_id(id)).collect(),
+    };
+    if fingerprint(&src) != meta.feed_hash {
+        return ids.iter().map(|id| short_id(id)).collect();
+    }
+    let mut by_id = std::collections::HashMap::new();
+    for (id, text) in parse_feed(&src) {
+        by_id.insert(id, text);
+    }
+    // Markdown --memories inits pin the .md as their feed: no JSONL turns,
+    // so zip bodies by init position instead of by hash.
+    if by_id.is_empty() {
+        let texts = parse_memories(&src);
+        if texts.len() == ids.len() {
+            return texts;
+        }
+    }
+    ids.iter().map(|id| by_id.remove(id).unwrap_or_else(|| short_id(id))).collect()
 }
 
 
@@ -315,6 +405,7 @@ fn fingerprint(s: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+#[allow(dead_code)]
 fn mem_id(i: u32) -> String {
     format!("mem-{i:04}")
 }
@@ -506,6 +597,7 @@ fn render_memory_region(
     heading: &str,
     ranked: &[(u32, f64)],
     items: &[String],
+    ids: &[String],
     votes: i64,
 ) -> String {
     let mut md = String::new();
@@ -521,7 +613,7 @@ fn render_memory_region(
         md.push_str(&format!(
             "- {body} <!-- sorter:rank {} score {s:.4} id {} -->\n",
             r + 1,
-            mem_id(*i)
+            short_id(&ids[*i as usize])
         ));
     }
     md.push_str(SORTER_END_MARKER);
@@ -603,17 +695,35 @@ fn load_scope(rt: &Runtime<Event>, scope: &str) -> ScopeData {
         .get(db)
         .unwrap_or_else(|e| fail(format!("read constitution: {e}")))
         .unwrap_or_default();
-    let mut items = Vec::with_capacity(meta.count as usize);
+    let mut ids = Vec::with_capacity(meta.count as usize);
     for i in 0..meta.count {
-        match s.items().get(db, &i) {
-            Ok(Some(t)) => items.push(t),
+        match s.item_ids().get(db, &i) {
+            Ok(Some(t)) => ids.push(t),
             Ok(None) => fail(format!("missing item {i} (store corrupt: rebuild)")),
             Err(e) => fail(format!("read item {i}: {e}")),
         }
     }
+    // Bodies live in the feed file, never on the tape: the recorded path +
+    // hash must still hold, or every text below is a lie. Fail cleanly.
+    if !meta.feed_path.is_empty() {
+        let src = fs::read_to_string(&meta.feed_path).unwrap_or_else(|_| {
+            fail(format!(
+                "feed moved: expected {} (feed hash {})",
+                meta.feed_path, meta.feed_hash
+            ))
+        });
+        if fingerprint(&src) != meta.feed_hash {
+            fail(format!(
+                "feed changed: {} no longer matches feed hash {} (re-run init)",
+                meta.feed_path, meta.feed_hash
+            ));
+        }
+    }
+    let items = resolve_bodies(&meta, &ids);
     ScopeData {
         meta,
         constitution,
+        ids,
         items,
     }
 }
@@ -621,6 +731,9 @@ fn load_scope(rt: &Runtime<Event>, scope: &str) -> ScopeData {
 struct ScopeData {
     meta: ScopeMeta,
     constitution: String,
+    /// Full 32-hex turn ids in init order; the tape's only identity.
+    ids: Vec<String>,
+    /// Display bodies resolved from the feed file at read time.
     items: Vec<String>,
 }
 
@@ -845,7 +958,9 @@ fn main() {
                 fs::remove_dir_all(&cli.state)
                     .unwrap_or_else(|e| fail(format!("wipe state: {e}")));
             }
-            let (raw, items) = match (&memories, &feed) {
+            // Bodies stay in the feed file: the tape takes only content-hash
+            // ids, plus the feed path + hash so every reader can resolve.
+            let (raw, ids, feed_path, feed_hash) = match (&memories, &feed) {
                 (Some(mem), None) => {
                     let src = fs::read_to_string(mem)
                         .unwrap_or_else(|e| fail(format!("read {}: {e}", mem.display())));
@@ -856,7 +971,7 @@ fn main() {
                             _ => "md".to_string(),
                         },
                     };
-                    let items = match fmt.as_str() {
+                    let texts = match fmt.as_str() {
                         "md" => {
                             let items = parse_memories(&src);
                             if items.is_empty() {
@@ -875,16 +990,21 @@ fn main() {
                         }
                         other => fail(format!("unknown --format '{other}': use md or jsonl")),
                     };
-                    (src, items)
+                    let ids: Vec<String> =
+                        texts.iter().map(|t| turn_id("", "", t)).collect();
+                    let fh = fingerprint(&src);
+                    (src, ids, mem.display().to_string(), fh)
                 }
                 (None, Some(feed)) => {
                     let src = fs::read_to_string(feed)
                         .unwrap_or_else(|e| fail(format!("read {}: {e}", feed.display())));
-                    let items = parse_feed(&src);
-                    if items.is_empty() {
+                    let pairs = parse_feed(&src);
+                    if pairs.is_empty() {
                         fail("no votable turns found in feed file");
                     }
-                    (src, items)
+                    let ids: Vec<String> = pairs.into_iter().map(|(id, _)| id).collect();
+                    let fh = fingerprint(&src);
+                    (src, ids, feed.display().to_string(), fh)
                 }
                 _ => fail("give exactly one of --memories or --feed"),
             };
@@ -898,8 +1018,10 @@ fn main() {
                 scope: scope.clone(),
                 memories_hash: fingerprint(&raw),
                 constitution_hash: fingerprint(&con),
-                items: items.clone(),
+                item_ids: ids.clone(),
                 constitution: con.clone(),
+                feed_path: feed_path.clone(),
+                feed_hash: feed_hash.clone(),
             })
             .unwrap_or_else(|e| fail(format!("append init: {e}")));
             println!(
@@ -907,9 +1029,12 @@ fn main() {
                 serde_json::json!({
                     "ok": true,
                     "scope": scope,
-                    "items": items.len(),
+                    "items": ids.len(),
                     "constitution_chars": con.len(),
                     "constitution_hash": fingerprint(&con),
+                    "feed_path": feed_path,
+                    "feed_hash": feed_hash,
+                    "sample_ids": ids.iter().take(3).collect::<Vec<_>>(),
                     "state": cli.state.display().to_string(),
                 })
             );
@@ -921,11 +1046,27 @@ fn main() {
             if n < 2 {
                 fail("need at least 2 memories to deal a pair");
             }
-            // mem-0012 or 12 — stable ids from ranking output, raw index, done.
+            // mem-<8hex> (stable content-hash handle), full 32-hex, or raw
+            // index — ranking output prints all three, any of them pins her.
             let parse_item = |s: &str| -> u32 {
-                let t = s.strip_prefix("mem-").unwrap_or(s);
-                t.parse::<u32>().unwrap_or_else(|_| {
-                    fail(format!("bad item '{s}': use mem-0012 or 12 (see ranking ids)"))
+                if let Some(h) = s.strip_prefix("mem-") {
+                    if let Ok(i) = h.parse::<u32>() {
+                        return i;
+                    }
+                    for (i, id) in data.ids.iter().enumerate() {
+                        if id == h || id.starts_with(h) || short_id(id) == s {
+                            return i as u32;
+                        }
+                    }
+                    fail(format!("bad item '{s}': no turn id starts with '{h}' (see ranking ids)"))
+                }
+                s.parse::<u32>().unwrap_or_else(|_| {
+                    for (i, id) in data.ids.iter().enumerate() {
+                        if id == s {
+                            return i as u32;
+                        }
+                    }
+                    fail(format!("bad item '{s}': use mem-<hex>, full id, or index (see ranking ids)"))
                 })
             };
             let voted = voted_set(&rt, &scope);
@@ -1015,6 +1156,8 @@ fn main() {
                 cmp_id: cmp_id.clone(),
                 a,
                 b,
+                a_hash: data.ids[a as usize].clone(),
+                b_hash: data.ids[b as usize].clone(),
             })
             .unwrap_or_else(|e| fail(format!("append deal: {e}")));
             println!(
@@ -1022,8 +1165,8 @@ fn main() {
                 serde_json::json!({
                     "comparison_id": cmp_id,
                     "scope": scope,
-                    "a": {"id": mem_id(a), "index": a, "text": data.items[a as usize]},
-                    "b": {"id": mem_id(b), "index": b, "text": data.items[b as usize]},
+                    "a": {"id": short_id(&data.ids[a as usize]), "hash": data.ids[a as usize], "index": a, "text": data.items[a as usize]},
+                    "b": {"id": short_id(&data.ids[b as usize]), "hash": data.ids[b as usize], "index": b, "text": data.items[b as usize]},
                     "constitution": data.constitution,
                     "constitution_hash": data.meta.constitution_hash,
                     "progress": progress_json(&rt, &scope, n as usize),
@@ -1084,6 +1227,8 @@ fn main() {
                 cmp_id: cmp_id.clone(),
                 a_item: p.a,
                 b_item: p.b,
+                a_hash: data.ids[p.a as usize].clone(),
+                b_hash: data.ids[p.b as usize].clone(),
                 a_share,
                 b_share,
                 winner: wi,
@@ -1101,8 +1246,9 @@ fn main() {
                     "ok": true,
                     "comparison_id": cmp_id,
                     "ratio": format!("{a_share}:{b_share}"),
-                    "winner": {"id": mem_id(wi), "text": data.items[wi as usize], "score": at(wi)},
-                    "loser": {"id": mem_id(li), "text": data.items[li as usize], "score": at(li)},
+                    "reason": reason,
+                    "winner": {"id": short_id(&data.ids[wi as usize]), "hash": data.ids[wi as usize], "text": data.items[wi as usize], "score": at(wi)},
+                    "loser": {"id": short_id(&data.ids[li as usize]), "hash": data.ids[li as usize], "text": data.items[li as usize], "score": at(li)},
                     "weight": weight,
                     "total_votes": vote_count(&rt, &scope),
                 })
@@ -1127,7 +1273,8 @@ fn main() {
                         "ranked": g.ranked.iter().enumerate().map(|(pos, &(m, s))| {
                             serde_json::json!({
                                 "group_rank": pos + 1,
-                                "id": mem_id(m as u32),
+                                "id": short_id(&data.ids[m]),
+                                "hash": data.ids[m],
                                 "index": m,
                                 "score": s,
                                 "text": data.items[m],
@@ -1158,7 +1305,7 @@ fn main() {
             for (gi, g) in groups.iter().take(top).enumerate() {
                 md.push_str(&format!("## group {gi} — {} items, {} pairs\n\n", g.members.len(), g.pairs));
                 for (pos, &(m, s)) in g.ranked.iter().enumerate() {
-                    md.push_str(&format!("### {}. {} · score {s:.4}\n\n{}\n\n", pos + 1, mem_id(m as u32), data.items[m]));
+                    md.push_str(&format!("### {}. {} · score {s:.4}\n\n{}\n\n", pos + 1, short_id(&data.ids[m]), data.items[m]));
                 }
             }
             fs::write(&output, md).unwrap_or_else(|e| fail(format!("write {}: {e}", output.display())));
@@ -1176,7 +1323,7 @@ fn main() {
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             ranked.truncate(top);
             let votes = vote_count(&rt, &scope);
-            let region = render_memory_region(&scope, &heading, &ranked, &data.items, votes);
+            let region = render_memory_region(&scope, &heading, &ranked, &data.items, &data.ids, votes);
             let out_path = output
                 .clone()
                 .or_else(|| input.clone())
@@ -1215,7 +1362,7 @@ fn main() {
         }
         Cmd::Log { scope, last } => {
             let rt = open_rt(&cli.state);
-            let _ = load_scope(&rt, &scope);
+            let data = load_scope(&rt, &scope);
             let len = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
             let start = len.saturating_sub(last as u64 * 4 + 16);
             let recs = rt
@@ -1226,8 +1373,10 @@ fn main() {
                 if let Event::Vote {
                     scope: s,
                     cmp_id,
-                    a_item: _,
-                    b_item: _,
+                    a_item,
+                    b_item,
+                    a_hash,
+                    b_hash,
                     a_share,
                     b_share,
                     winner,
@@ -1244,8 +1393,10 @@ fn main() {
                         "seq": r.seq,
                         "comparison_id": cmp_id,
                         "ratio": format!("{a_share}:{b_share}"),
-                        "winner": mem_id(winner),
-                        "loser": mem_id(loser),
+                        "winner": short_id(&tape_hash(&data.ids, winner, a_item, &a_hash, &b_hash)),
+                        "loser": short_id(&tape_hash(&data.ids, loser, a_item, &a_hash, &b_hash)),
+                        "winner_hash": tape_hash(&data.ids, winner, a_item, &a_hash, &b_hash),
+                        "loser_hash": tape_hash(&data.ids, loser, a_item, &a_hash, &b_hash),
                         "weight": weight,
                         "reason": reason,
                     }));
@@ -1273,7 +1424,7 @@ fn main() {
                     recs
                         .into_iter()
                         .filter_map(|r| match r.event {
-                            Event::Deal { scope: s, cmp_id: c, a, b } if s == scope && c == cmp_id => {
+                            Event::Deal { scope: s, cmp_id: c, a, b, a_hash: _, b_hash: _ } if s == scope && c == cmp_id => {
                                 Some((a, b))
                             }
                             _ => None,
@@ -1287,8 +1438,8 @@ fn main() {
                 serde_json::json!({
                     "comparison_id": cmp_id,
                     "scope": scope,
-                    "a": {"id": mem_id(a), "index": a, "text": data.items[a as usize]},
-                    "b": {"id": mem_id(b), "index": b, "text": data.items[b as usize]},
+                    "a": {"id": short_id(&data.ids[a as usize]), "hash": data.ids[a as usize], "index": a, "text": data.items[a as usize]},
+                    "b": {"id": short_id(&data.ids[b as usize]), "hash": data.ids[b as usize], "index": b, "text": data.items[b as usize]},
                     "constitution": data.constitution,
                 })
             );
@@ -1329,7 +1480,7 @@ fn main() {
                 let Some((a, b)) = deal_open_pair(&rt, &scope, n) else { break };
                 let seq = rt.log_len().unwrap_or_else(|e| fail(format!("read log len: {e}")));
                 let cmp_id = format!("cmp-{seq:04}");
-                rt.append(Event::Deal { scope: scope.clone(), cmp_id: cmp_id.clone(), a, b })
+                rt.append(Event::Deal { scope: scope.clone(), cmp_id: cmp_id.clone(), a, b, a_hash: data.ids[a as usize].clone(), b_hash: data.ids[b as usize].clone() })
                     .unwrap_or_else(|e| fail(format!("append deal: {e}")));
                 let vt0 = std::time::Instant::now();
                 let (ra, rb, reason) = match judge_pair(
@@ -1343,9 +1494,11 @@ fn main() {
                 let (wi, li) = if ra >= rb { (a, b) } else { (b, a) };
                 rt.append(Event::Vote {
                     scope: scope.clone(), cmp_id: cmp_id.clone(),
-                    a_item: a, b_item: b, a_share: ra, b_share: rb,
+                    a_item: a, b_item: b,
+                    a_hash: data.ids[a as usize].clone(), b_hash: data.ids[b as usize].clone(),
+                    a_share: ra, b_share: rb,
                     winner: wi, loser: li, weight,
-                    reason, constitution_hash: data.meta.constitution_hash.clone(),
+                    reason: reason.clone(), constitution_hash: data.meta.constitution_hash.clone(),
                 })
                 .unwrap_or_else(|e| fail(format!("append vote: {e}")));
                 let dt = vt0.elapsed().as_secs_f64();
@@ -1359,8 +1512,9 @@ fn main() {
                         "ok": true,
                         "comparison_id": cmp_id,
                         "ratio": format!("{ra}:{rb}"),
-                        "winner": {"id": mem_id(wi), "text": data.items[wi as usize], "score": at(wi)},
-                        "loser": {"id": mem_id(li), "text": data.items[li as usize], "score": at(li)},
+                        "reason": reason,
+                        "winner": {"id": short_id(&data.ids[wi as usize]), "hash": data.ids[wi as usize], "text": data.items[wi as usize], "score": at(wi)},
+                        "loser": {"id": short_id(&data.ids[li as usize]), "hash": data.ids[li as usize], "text": data.items[li as usize], "score": at(li)},
                         "weight": weight,
                         "total_votes": vote_count(&rt, &scope),
                     })
@@ -1374,8 +1528,8 @@ fn main() {
                 let eta_s = avg * (if want == 0 { vuc } else { target.saturating_sub(done) }) as f64;
                 let (em, es) = ((eta_s / 60.0) as u64, (eta_s % 60.0) as u64);
                 eprintln!(
-                    "[{}/{}] {} a:{} b:{} ratio {ra}:{rb} elapsed {:.0}s avg {:.1}s/vote ETA {:02}:{:02} votes_until_connected {vuc}",
-                    already + done, total_disp, cmp_id, mem_id(a), mem_id(b), elapsed, avg, em, es
+                    "[{}/{}] {} a:{} b:{} ratio {ra}:{rb} reason {:.120} elapsed {:.0}s avg {:.1}s/vote ETA {:02}:{:02} votes_until_connected {vuc}",
+                    already + done, total_disp, cmp_id, short_id(&data.ids[a as usize]), short_id(&data.ids[b as usize]), reason, elapsed, avg, em, es
                 );
                 // Keep stderr wet and immediate: flush every line.
                 use std::io::Write as _;
@@ -1442,6 +1596,29 @@ mod tests {
     }
 
     #[test]
+    fn turn_ids_are_stable_and_distinct() {
+        let a = turn_id("user", "2026-09-27T06:55:46.110Z", "talk to me");
+        assert_eq!(a, turn_id("user", "2026-09-27T06:55:46.110Z", "talk to me"));
+        assert_eq!(a.len(), 32);
+        // Same text, different timestamp: a different turn, a different id.
+        assert_ne!(a, turn_id("user", "2026-09-27T06:55:47.110Z", "talk to me"));
+        assert_ne!(a, turn_id("assistant", "2026-09-27T06:55:46.110Z", "talk to me"));
+        assert_eq!(short_id(&a), format!("mem-{}", &a[..8]));
+    }
+
+    #[test]
+    fn feed_ids_survive_reextract() {
+        let feed = concat!(
+            "{\"role\":\"user\",\"timestamp\":\"t1\",\"text\":\"hello\"}\n",
+            "{\"role\":\"assistant\",\"timestamp\":\"t2\",\"text\":\"hi\"}\n",
+        );
+        let once: Vec<String> = parse_feed(feed).into_iter().map(|(id, _)| id).collect();
+        let twice: Vec<String> = parse_feed(feed).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(once, twice);
+        assert_eq!(once.len(), 2);
+    }
+
+    #[test]
     fn ignores_blockquote_and_heading() {
         let items = parse_memories("> quote\n\n# head\n\nplain\n\n- a\n- b\n");
         assert_eq!(items, vec!["a".to_string(), "b".to_string()]);
@@ -1456,7 +1633,11 @@ mod tests {
 
     fn sample_region(scope: &str, note: &str) -> String {
         let items = vec![format!("alpha {note}"), "beta".to_string()];
-        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, 7)
+        let ids = vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        render_memory_region(scope, "Ranked working set", &[(0, 0.6), (1, 0.4)], &items, &ids, 7)
     }
 
     #[test]
@@ -1464,8 +1645,8 @@ mod tests {
         let r = sample_region("world", "x");
         assert!(r.starts_with("<!-- sorter:begin scope=world -->\n"));
         assert!(r.trim_end().ends_with("<!-- sorter:end -->"));
-        assert!(r.contains("- alpha x <!-- sorter:rank 1 score 0.6000 id mem-0000 -->"));
-        assert!(r.contains("- beta <!-- sorter:rank 2 score 0.4000 id mem-0001 -->"));
+        assert!(r.contains("- alpha x <!-- sorter:rank 1 score 0.6000 id mem-aaaaaaaa -->"));
+        assert!(r.contains("- beta <!-- sorter:rank 2 score 0.4000 id mem-bbbbbbbb -->"));
     }
 
     #[test]
